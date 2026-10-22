@@ -19,7 +19,7 @@ Hover it for the full breakdown:
 
 ![Hover panel](docs/img/panel.png)
 
-- **Small.** One ~0.5 MB portable `.exe`, ~3.5 MB of RAM, about 0% CPU at
+- **Small.** One ~0.5 MB portable `.exe`, ~3.5 MB of RAM (measured), about 0% CPU at
   idle. Plain Win32 + Direct2D, no GUI framework, no runtime, no service.
 - **Embedded.** A layered child window of the taskbar, so it moves, hides and
   auto-hides with it. It falls back to a small always-on-top strip if embedding
@@ -59,10 +59,12 @@ Manager uses.
 
 Right-click the strip:
 
-- **Display**: show in the taskbar or as a tray icon only, pick the layout,
+- **Display**: show in the taskbar, as a tray icon, or both; pick the layout;
   and toggle CPU, GPU, commit and disk.
-  - *Tray icon only*: two small bars (RAM split Windows / WSL, and commit);
-    hover for the panel, right-click for the menu.
+  - *Tray icon*: two small bars (RAM split Windows / WSL, and commit); hover
+    for the panel, right-click for the menu. "Keep tray icon visible" pins it
+    next to the clock instead of under ^ (the same switch as Settings >
+    Personalization > Taskbar > Other system tray icons).
   - *Grid*: two lines per metric (shown above).
   - *Windows / WSL rows*: one row each, with RAM, disk and CPU side by side.
   - *Bars*: one column per resource, with a bar split Windows (blue) / WSL (orange).

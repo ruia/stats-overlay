@@ -60,12 +60,22 @@ PDH is gone (it cost ~4 MB per counter set). Check:
 - GPU: compare with Task Manager > Performance > GPU (the big % is the busiest
   engine) and "Dedicated GPU memory" against the panel's VRAM, e.g. while a
   video or game runs.
-## 6. Tray icon only (right-click > Display > Tray icon only)
+## 6. Tray icon (right-click > Display)
 
-- The strip disappears and a tray icon appears with two bars: RAM (blue =
-  Windows, orange = WSL) and commit. If it lands in the overflow (^), drag it
-  onto the taskbar.
-- Hovering shows the panel above the icon, left-click opens Task Manager,
-  right-click shows the menu. Display > Show in taskbar brings the strip back.
-- Restart StatsOverlay: it should come back in the same mode.
+- **Tray icon only**: the strip disappears and a two-bar icon appears (blue =
+  Windows RAM, orange = WSL RAM, second bar = commit). No "Mode" line in its
+  panel.
+- **Keep tray icon visible**: the icon moves out of ^ next to the clock
+  (maybe after a few seconds; tell me if it needs an Explorer restart).
+- **Taskbar and tray icon**: both show; hovering either opens the panel next to
+  the one you hovered.
+- Hover / left-click / right-click on the icon: panel / Task Manager / menu.
+- Restart StatsOverlay: it comes back in the same mode.
+- Display > untick Commit: the icon's second bar shows C: instead; untick
+  Disk too and it shows just the RAM bar. The same toggles now also hide those
+  rows/sections in the hover panel.
 
+## 7. Memory after menus
+
+Open the right-click menu, close it, and the WSL settings Custom… box: memory
+should drop back to ~3.5-4 MB within a second instead of staying at ~7 MB.

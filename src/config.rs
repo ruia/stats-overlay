@@ -32,10 +32,37 @@ impl Layout {
     }
 }
 
+/// Where the readout appears.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Show {
+    Taskbar,
+    Tray,
+    Both,
+}
+
+impl Show {
+    pub const ALL: [Show; 3] = [Show::Taskbar, Show::Tray, Show::Both];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Show::Taskbar => "Show in taskbar",
+            Show::Tray => "Tray icon only",
+            Show::Both => "Taskbar and tray icon",
+        }
+    }
+
+    pub fn strip(self) -> bool {
+        self != Show::Tray
+    }
+
+    pub fn tray(self) -> bool {
+        self != Show::Taskbar
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub struct Config {
-    /// Notification-area icon instead of the taskbar strip.
-    pub tray: bool,
+    pub show: Show,
     pub layout: Layout,
     pub cpu: bool,
     pub gpu: bool,
@@ -79,7 +106,11 @@ impl Config {
         let get = |name: &str| reg_dword(HKEY_CURRENT_USER, KEY, name);
         let on = |t: Toggle| get(t.name()) != Some(0);
         Config {
-            tray: get("TrayOnly") == Some(1),
+            show: match get("Show") {
+                Some(1) => Show::Tray,
+                Some(2) => Show::Both,
+                _ => Show::Taskbar,
+            },
             layout: match get("Layout") {
                 Some(1) => Layout::ByOwner,
                 Some(2) => Layout::Bars,
@@ -108,9 +139,10 @@ impl Config {
         save("Layout", i as u32);
     }
 
-    pub fn set_tray(&mut self, tray: bool) {
-        self.tray = tray;
-        save("TrayOnly", tray as u32);
+    pub fn set_show(&mut self, show: Show) {
+        self.show = show;
+        let i = Show::ALL.iter().position(|&s| s == show).unwrap_or(0);
+        save("Show", i as u32);
     }
 
     pub fn flip(&mut self, t: Toggle) {

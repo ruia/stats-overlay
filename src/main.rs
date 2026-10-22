@@ -31,7 +31,7 @@ mod util;
 mod wsl;
 mod wslconfig;
 
-use config::{Config, Layout, Toggle};
+use config::{Config, Layout, Show, Toggle};
 use disk::DiskSnap;
 use render::{bar, seg, Column, Renderer, Seg, Style};
 use sampler::{Snapshot, WslState, WM_APP_SAMPLE};
@@ -63,8 +63,9 @@ const ID_STARTUP: usize = 5;
 const ID_WSLCONFIG_OPEN: usize = 6;
 const ID_MEMORY_CUSTOM: usize = 7;
 const ID_WSL_SETTINGS_APP: usize = 8;
-const ID_SHOW_STRIP: usize = 9;
-const ID_SHOW_TRAY: usize = 10;
+const ID_TRAY_PROMOTE: usize = 9;
+/// + index into Show::ALL.
+const ID_SHOW: usize = 90;
 const NIN_SELECT: u32 = WM_USER;
 const NIN_KEYSELECT: u32 = WM_USER + 1;
 const NIN_POPUPOPEN: u32 = WM_USER + 6;
@@ -109,6 +110,8 @@ struct App {
     opts: Opts,
     config: Cell<Config>,
     tray: RefCell<Option<tray::Tray>>,
+    /// The panel is open for the tray icon (else for the strip).
+    hover_tray: Cell<bool>,
     strip: RefCell<Option<Renderer>>,
     panel_renderer: RefCell<Option<Renderer>>,
 }
@@ -177,6 +180,7 @@ fn main() {
             opts,
             config: Cell::new(Config::load()),
             tray: RefCell::new(None),
+            hover_tray: Cell::new(false),
             strip: RefCell::new(
                 Renderer::new(Style {
                     font_dip: 12.0,
@@ -228,89 +232,11 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             app.light.set(theme::system_light());
             refresh();
         }
-        WM_COMMAND => match wp.0 & 0xffff {
-            ID_TASKMGR => open_task_manager(),
-            ID_RECLAIM => run_action(|| {
-                wsl::reclaim_cache(&wsl::running_distros());
-            }),
-            ID_SHUTDOWN => {
-                if confirm_shutdown() {
-                    run_action(|| {
-                        wsl::shutdown();
-                    });
-                }
-            }
-            ID_STARTUP => {
-                startup::set(!startup::enabled());
-            }
-            ID_WSLCONFIG_OPEN => open_wslconfig(),
-            ID_WSL_SETTINGS_APP => {
-                if let Some(exe) = wslconfig::settings_app() {
-                    let e = wide(&exe.to_string_lossy());
-                    unsafe {
-                        ShellExecuteW(
-                            None,
-                            w!("open"),
-                            util::pcwstr(&e),
-                            None,
-                            None,
-                            SW_SHOWNORMAL,
-                        );
-                    }
-                }
-            }
-            ID_MEMORY_CUSTOM => {
-                let total = latest().map_or(0, |s| s.total);
-                let max = ((total as f64 / GIB).round() as u32).max(1);
-                let current = wslconfig::read()
-                    .memory
-                    .map_or(max / 2, |b| (b as f64 / GIB).round() as u32);
-                unsafe {
-                    let _ = SetForegroundWindow(hwnd);
-                }
-                if let Some(gb) = prompt::memory_gb(hwnd, current, max) {
-                    wslconfig_changed(wslconfig::set_memory(Some(gb)));
-                }
-            }
-            id @ ID_LAYOUT..ID_TOGGLE => {
-                if let Some(&l) = Layout::ALL.get(id - ID_LAYOUT) {
-                    let mut c = app.config.get();
-                    c.set_layout(l);
-                    set_config(c);
-                }
-            }
-            id @ ID_TOGGLE..ID_RECLAIM_MODE => {
-                if let Some(&t) = Toggle::ALL.get(id - ID_TOGGLE) {
-                    let mut c = app.config.get();
-                    c.flip(t);
-                    set_config(c);
-                }
-            }
-            id @ ID_RECLAIM_MODE..ID_MEMORY => {
-                if let Some(&(r, _)) = RECLAIM_CHOICES.get(id - ID_RECLAIM_MODE) {
-                    wslconfig_changed(wslconfig::set_reclaim(r));
-                }
-            }
-            id @ ID_MEMORY..140 => {
-                if let Some(&gb) = MEMORY_CHOICES.get(id - ID_MEMORY) {
-                    wslconfig_changed(wslconfig::set_memory(gb));
-                }
-            }
-            ID_SHOW_STRIP | ID_SHOW_TRAY => {
-                let mut c = app.config.get();
-                c.set_tray(wp.0 & 0xffff == ID_SHOW_TRAY);
-                set_config(c);
-            }
-            ID_EXIT => unsafe {
-                hide_panel();
-                destroy_overlay();
-                if let Some(t) = app.tray.borrow_mut().as_mut() {
-                    t.remove();
-                }
-                let _ = DestroyWindow(hwnd);
-            },
-            _ => {}
-        },
+        WM_COMMAND => {
+            command(hwnd, wp.0 & 0xffff);
+            // Dialogs and message boxes leave pages resident too.
+            trim();
+        }
         tray::WM_APP_TRAY => match (lp.0 & 0xffff) as u32 {
             WM_CONTEXTMENU => {
                 app.hovering.set(false);
@@ -320,6 +246,7 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             NIN_SELECT | NIN_KEYSELECT => open_task_manager(),
             NIN_POPUPOPEN => {
                 app.hovering.set(true);
+                app.hover_tray.set(true);
                 update_panel();
             }
             NIN_POPUPCLOSE => {
@@ -343,6 +270,109 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
     LRESULT(0)
 }
 
+fn command(hwnd: HWND, id: usize) {
+    let app = app();
+    match id {
+        ID_TASKMGR => open_task_manager(),
+        ID_RECLAIM => run_action(|| {
+            wsl::reclaim_cache(&wsl::running_distros());
+        }),
+        ID_SHUTDOWN => {
+            if confirm_shutdown() {
+                run_action(|| {
+                    wsl::shutdown();
+                });
+            }
+        }
+        ID_STARTUP => {
+            startup::set(!startup::enabled());
+        }
+        ID_WSLCONFIG_OPEN => open_wslconfig(),
+        ID_WSL_SETTINGS_APP => {
+            if let Some(exe) = wslconfig::settings_app() {
+                let e = wide(&exe.to_string_lossy());
+                unsafe {
+                    ShellExecuteW(
+                        None,
+                        w!("open"),
+                        util::pcwstr(&e),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+            }
+        }
+        ID_MEMORY_CUSTOM => {
+            let total = latest().map_or(0, |s| s.total);
+            let max = ((total as f64 / GIB).round() as u32).max(1);
+            let current = wslconfig::read()
+                .memory
+                .map_or(max / 2, |b| (b as f64 / GIB).round() as u32);
+            unsafe {
+                let _ = SetForegroundWindow(hwnd);
+            }
+            if let Some(gb) = prompt::memory_gb(hwnd, current, max) {
+                wslconfig_changed(wslconfig::set_memory(Some(gb)));
+            }
+        }
+        id @ ID_LAYOUT..ID_TOGGLE => {
+            if let Some(&l) = Layout::ALL.get(id - ID_LAYOUT) {
+                let mut c = app.config.get();
+                c.set_layout(l);
+                set_config(c);
+            }
+        }
+        id @ ID_TOGGLE..ID_RECLAIM_MODE => {
+            if let Some(&t) = Toggle::ALL.get(id - ID_TOGGLE) {
+                let mut c = app.config.get();
+                c.flip(t);
+                set_config(c);
+            }
+        }
+        id @ ID_RECLAIM_MODE..ID_MEMORY => {
+            if let Some(&(r, _)) = RECLAIM_CHOICES.get(id - ID_RECLAIM_MODE) {
+                wslconfig_changed(wslconfig::set_reclaim(r));
+            }
+        }
+        id @ ID_MEMORY..140 => {
+            if let Some(&gb) = MEMORY_CHOICES.get(id - ID_MEMORY) {
+                wslconfig_changed(wslconfig::set_memory(gb));
+            }
+        }
+        id @ ID_SHOW..ID_LAYOUT => {
+            if let Some(&show) = Show::ALL.get(id - ID_SHOW) {
+                let mut c = app.config.get();
+                c.set_show(show);
+                set_config(c);
+            }
+        }
+        ID_TRAY_PROMOTE => {
+            let on = tray::promoted() != Some(true);
+            if !tray::promote(on) {
+                unsafe {
+                    let _ = SetForegroundWindow(hwnd);
+                    MessageBoxW(
+                        Some(hwnd),
+                        w!("Windows hasn't registered the tray icon yet. Try again in a few seconds, or use Settings > Personalization > Taskbar > Other system tray icons."),
+                        w!("StatsOverlay"),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+            }
+        }
+        ID_EXIT => unsafe {
+            hide_panel();
+            destroy_overlay();
+            if let Some(t) = app.tray.borrow_mut().as_mut() {
+                t.remove();
+            }
+            let _ = DestroyWindow(hwnd);
+        },
+        _ => {}
+    }
+}
+
 extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
@@ -352,6 +382,7 @@ extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
     match msg {
         WM_MOUSEMOVE => {
             if !app.hovering.replace(true) {
+                app.hover_tray.set(false);
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -482,16 +513,18 @@ fn refresh() {
         }
         return;
     };
-    if app.config.get().tray {
-        destroy_overlay();
+    let show = app.config.get().show;
+    if show.tray() {
         update_tray(&snap);
+    } else if let Some(t) = app.tray.borrow_mut().as_mut() {
+        t.remove();
+    }
+    if !show.strip() {
+        destroy_overlay();
         if app.hovering.get() {
             update_panel();
         }
         return;
-    }
-    if let Some(t) = app.tray.borrow_mut().as_mut() {
-        t.remove();
     }
     let Some(hwnd) = ensure_overlay(tb) else {
         return;
@@ -758,7 +791,14 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
 }
 
 /// The hover breakdown in sections; a label column and a value column.
-fn panel_columns(s: &Snapshot, d: Option<&DiskSnap>, p: &Palette, embedded: bool) -> Vec<Column> {
+/// Display > CPU / GPU / Commit / Disk apply here as well as to the strip.
+fn panel_columns(
+    s: &Snapshot,
+    d: Option<&DiskSnap>,
+    c: &Config,
+    p: &Palette,
+    embedded: bool,
+) -> Vec<Column> {
     let mut labels: Column = Vec::new();
     let mut values: Column = Vec::new();
     let mut row = |label: Seg, value: Vec<Seg>| {
@@ -800,7 +840,7 @@ fn panel_columns(s: &Snapshot, d: Option<&DiskSnap>, p: &Palette, embedded: bool
         ),
         None => row(l("   WSL VM"), vec![dim("off".into())]),
     }
-    if let Some((c, lim)) = s.commit {
+    if let (true, Some((c, lim))) = (c.commit, s.commit) {
         let f = c as f64 / lim.max(1) as f64;
         let mut val = vec![
             seg(format!("{} / {}", g(c), g(lim)), theme::level(p, f), true),
@@ -842,11 +882,11 @@ fn panel_columns(s: &Snapshot, d: Option<&DiskSnap>, p: &Palette, embedded: bool
             ],
         },
     );
-    if let Some(w) = s.wsl_cpu {
+    if let (true, Some(w)) = (c.cpu, s.wsl_cpu) {
         row(l("CPU"), vec![v(pct(w))]);
     }
 
-    if let Some(d) = d {
+    if let (true, Some(d)) = (c.disk, d) {
         row(l(""), vec![]);
         row(head("DISK"), vec![]);
         for drive in &d.drives {
@@ -887,14 +927,27 @@ fn panel_columns(s: &Snapshot, d: Option<&DiskSnap>, p: &Palette, embedded: bool
         }
     }
 
-    row(l(""), vec![]);
-    row(head("CPU · GPU"), vec![]);
-    row(l("CPU"), vec![v(s.cpu.map_or("–".into(), pct))]);
-    let mut gpu = vec![v(s.gpu.map_or("–".into(), |x| pct(x.percent)))];
-    if let Some(vram) = s.gpu.and_then(|x| x.vram) {
-        gpu.push(dim(format!("  VRAM {}", g(vram))));
+    if c.cpu || c.gpu {
+        row(l(""), vec![]);
+        row(
+            head(match (c.cpu, c.gpu) {
+                (true, true) => "CPU · GPU",
+                (true, false) => "CPU",
+                _ => "GPU",
+            }),
+            vec![],
+        );
     }
-    row(l("GPU"), gpu);
+    if c.cpu {
+        row(l("CPU"), vec![v(s.cpu.map_or("–".into(), pct))]);
+    }
+    if c.gpu {
+        let mut gpu = vec![v(s.gpu.map_or("–".into(), |x| pct(x.percent)))];
+        if let Some(vram) = s.gpu.and_then(|x| x.vram) {
+            gpu.push(dim(format!("  VRAM {}", g(vram))));
+        }
+        row(l("GPU"), gpu);
+    }
     if !embedded {
         row(
             l("Mode"),
@@ -904,12 +957,29 @@ fn panel_columns(s: &Snapshot, d: Option<&DiskSnap>, p: &Palette, embedded: bool
     vec![labels, values]
 }
 
+/// The tray icon's second bar: commit, else the system drive, as Display allows.
+fn second_bar(s: &Snapshot) -> Option<f32> {
+    let c = app().config.get();
+    let frac = |a: u64, b: u64| a as f32 / b.max(1) as f32;
+    if c.commit {
+        if let Some((u, l)) = s.commit {
+            return Some(frac(u, l));
+        }
+    }
+    if c.disk {
+        let d = disk_snap()?;
+        let sys = d.system()?;
+        return Some(frac(sys.used(), sys.total));
+    }
+    None
+}
+
 fn update_tray(s: &Snapshot) {
     let frac = |a: u64, b: u64| a as f32 / b.max(1) as f32;
     let bars = tray::Bars {
         win: frac(s.windows(), s.total),
         wsl: frac(s.vm_ram(), s.total),
-        commit: s.commit.map_or(0.0, |(u, l)| frac(u, l)),
+        second: second_bar(s),
     };
     let mut tip = format!(
         "WIN {}  WSL {}  ALL {}",
@@ -935,7 +1005,7 @@ fn update_tray(s: &Snapshot) {
 /// Where the panel hangs from: the strip, or the tray icon.
 fn panel_anchor() -> Option<RECT> {
     let app = app();
-    if app.config.get().tray {
+    if app.hover_tray.get() || !app.config.get().show.strip() {
         return app.tray.borrow().as_ref().and_then(tray::Tray::rect);
     }
     let strip = app.overlay.get()?;
@@ -984,7 +1054,13 @@ fn update_panel() {
     r.set_background(Some(p.panel));
     let scale = taskbar::dpi(tb) as f32 / 96.0;
     let Ok((w, h)) = r.prepare(
-        &panel_columns(&snap, disk_snap().as_ref(), &p, app.parent.get().is_some()),
+        &panel_columns(
+            &snap,
+            disk_snap().as_ref(),
+            &app.config.get(),
+            &p,
+            app.hover_tray.get() || app.parent.get().is_some(),
+        ),
         scale,
         None,
     ) else {
@@ -1015,8 +1091,9 @@ fn update_panel() {
 
 fn hide_panel() {
     if let Some(h) = app().panel.get() {
-        unsafe {
-            let _ = ShowWindow(h, SW_HIDE);
+        // ShowWindow returns whether it was visible.
+        if unsafe { ShowWindow(h, SW_HIDE) }.as_bool() {
+            trim();
         }
     }
 }
@@ -1148,8 +1225,16 @@ fn separator(menu: HMENU) {
 fn display_menu() -> Option<HMENU> {
     let c = app().config.get();
     let m = unsafe { CreatePopupMenu().ok()? };
-    menu_item(m, true, !c.tray, ID_SHOW_STRIP, "Show in taskbar");
-    menu_item(m, true, c.tray, ID_SHOW_TRAY, "Tray icon only");
+    for (i, s) in Show::ALL.iter().enumerate() {
+        menu_item(m, true, c.show == *s, ID_SHOW + i, s.label());
+    }
+    menu_item(
+        m,
+        c.show.tray(),
+        tray::promoted() == Some(true),
+        ID_TRAY_PROMOTE,
+        "Keep tray icon visible (not under ^)",
+    );
     separator(m);
     for (i, l) in Layout::ALL.iter().enumerate() {
         menu_item(m, true, c.layout == *l, ID_LAYOUT + i, l.label());
@@ -1259,5 +1344,16 @@ fn show_menu() {
         let _ = PostMessageW(Some(host), WM_NULL, WPARAM(0), LPARAM(0));
         // Destroys the submenus too.
         let _ = DestroyMenu(menu);
+    }
+    trim();
+}
+
+/// Gives back the pages that menus, dialogs and the panel pulled in (themed menu
+/// rendering alone adds ~3 MB that would otherwise stay resident).
+fn trim() {
+    use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let _ = K32EmptyWorkingSet(GetCurrentProcess());
     }
 }
