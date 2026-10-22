@@ -34,6 +34,8 @@ impl Layout {
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Config {
+    /// Notification-area icon instead of the taskbar strip.
+    pub tray: bool,
     pub layout: Layout,
     pub cpu: bool,
     pub gpu: bool,
@@ -77,6 +79,7 @@ impl Config {
         let get = |name: &str| reg_dword(HKEY_CURRENT_USER, KEY, name);
         let on = |t: Toggle| get(t.name()) != Some(0);
         Config {
+            tray: get("TrayOnly") == Some(1),
             layout: match get("Layout") {
                 Some(1) => Layout::ByOwner,
                 Some(2) => Layout::Bars,
@@ -103,6 +106,11 @@ impl Config {
         self.layout = layout;
         let i = Layout::ALL.iter().position(|&l| l == layout).unwrap_or(0);
         save("Layout", i as u32);
+    }
+
+    pub fn set_tray(&mut self, tray: bool) {
+        self.tray = tray;
+        save("TrayOnly", tray as u32);
     }
 
     pub fn flip(&mut self, t: Toggle) {

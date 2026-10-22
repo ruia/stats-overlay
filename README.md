@@ -1,10 +1,15 @@
 # StatsOverlay
 
-**How much of your RAM and disk is Windows, and how much is WSL?**
+**A tiny RAM / CPU / GPU / disk monitor inside the Windows 11 taskbar, that also
+tells you how much of it is Windows and how much is WSL.**
 
-StatsOverlay is a tiny readout that lives *inside* the Windows 11 taskbar and
-splits memory and disk between Windows and the WSL 2 VM (including Docker
-Desktop), so you can see at a glance when `VmmemWSL` is eating your machine.
+StatsOverlay is a tiny readout that lives *inside* the Windows 11 taskbar (or
+as a tray icon). It's a general system monitor, and it works without WSL. If
+you use WSL 2 or Docker Desktop, it splits memory and disk between Windows and
+the WSL VM, so you can see at a glance when `VmmemWSL` is eating your machine.
+
+*Also known as: WSL taskbar monitor, vmmem / VmmemWSL memory monitor, Windows 11
+taskbar RAM monitor, taskbar system stats.*
 
 ![Grid layout](docs/img/strip-grid.png)
 
@@ -28,7 +33,7 @@ Hover it for the full breakdown:
 
 | | |
 | --- | --- |
-| **WIN / WSL** | RAM used by Windows vs. the WSL VM. They add up to **ALL** (Task Manager's "In use"). |
+| **WIN / WSL** | RAM used by Windows vs. the WSL VM. They add up to **ALL** (Task Manager's "In use"). Without WSL, WSL shows "off" and WIN is everything. |
 | **CMT** | Commit charge: committed / commit limit. Running out of commit, not RAM, is what makes allocations fail, and the VM can push it high. |
 | **CPU / GPU** | Task Manager-style CPU utilization and busiest GPU engine (+ dedicated VRAM in the panel). |
 | **C:** | Drive used / total. In the panel, "Windows" is what's left after subtracting WSL's virtual disks. |
@@ -54,7 +59,10 @@ Manager uses.
 
 Right-click the strip:
 
-- **Display**: pick the layout and toggle CPU, GPU, commit and disk.
+- **Display**: show in the taskbar or as a tray icon only, pick the layout,
+  and toggle CPU, GPU, commit and disk.
+  - *Tray icon only*: two small bars (RAM split Windows / WSL, and commit);
+    hover for the panel, right-click for the menu.
   - *Grid*: two lines per metric (shown above).
   - *Windows / WSL rows*: one row each, with RAM, disk and CPU side by side.
   - *Bars*: one column per resource, with a bar split Windows (blue) / WSL (orange).
@@ -143,6 +151,7 @@ Windows vs. WSL split: compressed VM memory, commit, and virtual disk space.
 | `src/render.rs` | Direct2D/DirectWrite into a premultiplied DIB, `UpdateLayeredWindow` |
 | `src/taskbar.rs` | Finding the taskbar, alignment, Widgets button, top/bottom |
 | `src/theme.rs` | Light/dark, colors |
+| `src/tray.rs` | Tray-icon mode: icon drawing, tooltip, anchor for the panel |
 | `src/startup.rs` | Start with Windows (HKCU Run key) |
 | `src/diag.rs` | `--diag` report |
 | `build.rs`, `app.manifest`, `app.rc` | Embeds the manifest (DPI awareness, Windows 10/11 compatibility) |

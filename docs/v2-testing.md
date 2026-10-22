@@ -60,3 +60,12 @@ PDH is gone (it cost ~4 MB per counter set). Check:
 - GPU: compare with Task Manager > Performance > GPU (the big % is the busiest
   engine) and "Dedicated GPU memory" against the panel's VRAM, e.g. while a
   video or game runs.
+## 6. Tray icon only (right-click > Display > Tray icon only)
+
+- The strip disappears and a tray icon appears with two bars: RAM (blue =
+  Windows, orange = WSL) and commit. If it lands in the overflow (^), drag it
+  onto the taskbar.
+- Hovering shows the panel above the icon, left-click opens Task Manager,
+  right-click shows the menu. Display > Show in taskbar brings the strip back.
+- Restart StatsOverlay: it should come back in the same mode.
+

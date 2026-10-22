@@ -26,6 +26,7 @@ mod sampler;
 mod startup;
 mod taskbar;
 mod theme;
+mod tray;
 mod util;
 mod wsl;
 mod wslconfig;
@@ -62,6 +63,12 @@ const ID_STARTUP: usize = 5;
 const ID_WSLCONFIG_OPEN: usize = 6;
 const ID_MEMORY_CUSTOM: usize = 7;
 const ID_WSL_SETTINGS_APP: usize = 8;
+const ID_SHOW_STRIP: usize = 9;
+const ID_SHOW_TRAY: usize = 10;
+const NIN_SELECT: u32 = WM_USER;
+const NIN_KEYSELECT: u32 = WM_USER + 1;
+const NIN_POPUPOPEN: u32 = WM_USER + 6;
+const NIN_POPUPCLOSE: u32 = WM_USER + 7;
 /// + index into Layout::ALL.
 const ID_LAYOUT: usize = 100;
 /// + index into Toggle::ALL.
@@ -101,6 +108,7 @@ struct App {
     msg_taskbar_created: u32,
     opts: Opts,
     config: Cell<Config>,
+    tray: RefCell<Option<tray::Tray>>,
     strip: RefCell<Option<Renderer>>,
     panel_renderer: RefCell<Option<Renderer>>,
 }
@@ -168,6 +176,7 @@ fn main() {
             msg_taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             opts,
             config: Cell::new(Config::load()),
+            tray: RefCell::new(None),
             strip: RefCell::new(
                 Renderer::new(Style {
                     font_dip: 12.0,
@@ -200,6 +209,7 @@ fn main() {
             return;
         };
         app.host.set(host);
+        *app.tray.borrow_mut() = Some(tray::Tray::new(host));
         sampler::spawn(host);
 
         let mut msg = MSG::default();
@@ -286,11 +296,36 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                     wslconfig_changed(wslconfig::set_memory(gb));
                 }
             }
+            ID_SHOW_STRIP | ID_SHOW_TRAY => {
+                let mut c = app.config.get();
+                c.set_tray(wp.0 & 0xffff == ID_SHOW_TRAY);
+                set_config(c);
+            }
             ID_EXIT => unsafe {
                 hide_panel();
                 destroy_overlay();
+                if let Some(t) = app.tray.borrow_mut().as_mut() {
+                    t.remove();
+                }
                 let _ = DestroyWindow(hwnd);
             },
+            _ => {}
+        },
+        tray::WM_APP_TRAY => match (lp.0 & 0xffff) as u32 {
+            WM_CONTEXTMENU => {
+                app.hovering.set(false);
+                hide_panel();
+                show_menu();
+            }
+            NIN_SELECT | NIN_KEYSELECT => open_task_manager(),
+            NIN_POPUPOPEN => {
+                app.hovering.set(true);
+                update_panel();
+            }
+            NIN_POPUPCLOSE => {
+                app.hovering.set(false);
+                hide_panel();
+            }
             _ => {}
         },
         WM_DESTROY => unsafe { PostQuitMessage(0) },
@@ -298,6 +333,9 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             // Explorer restarted: the old taskbar (and our child) are gone or stale.
             hide_panel();
             destroy_overlay();
+            if let Some(t) = app.tray.borrow_mut().as_mut() {
+                t.reset();
+            }
             refresh();
         }
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
@@ -444,6 +482,17 @@ fn refresh() {
         }
         return;
     };
+    if app.config.get().tray {
+        destroy_overlay();
+        update_tray(&snap);
+        if app.hovering.get() {
+            update_panel();
+        }
+        return;
+    }
+    if let Some(t) = app.tray.borrow_mut().as_mut() {
+        t.remove();
+    }
     let Some(hwnd) = ensure_overlay(tb) else {
         return;
     };
@@ -855,9 +904,49 @@ fn panel_columns(s: &Snapshot, d: Option<&DiskSnap>, p: &Palette, embedded: bool
     vec![labels, values]
 }
 
+fn update_tray(s: &Snapshot) {
+    let frac = |a: u64, b: u64| a as f32 / b.max(1) as f32;
+    let bars = tray::Bars {
+        win: frac(s.windows(), s.total),
+        wsl: frac(s.vm_ram(), s.total),
+        commit: s.commit.map_or(0.0, |(u, l)| frac(u, l)),
+    };
+    let mut tip = format!(
+        "WIN {}  WSL {}  ALL {}",
+        gib(s.windows()),
+        if s.vm.is_some() {
+            gib(s.vm_ram())
+        } else {
+            "off".into()
+        },
+        of(s.used, s.total)
+    );
+    if let Some((u, l)) = s.commit {
+        tip.push_str(&format!("\nCMT {}", pct(frac(u, l) as f64 * 100.0)));
+    }
+    if let Some(c) = s.cpu {
+        tip.push_str(&format!("  CPU {}", pct(c)));
+    }
+    if let Some(t) = app().tray.borrow_mut().as_mut() {
+        t.update(bars, &tip, &palette());
+    }
+}
+
+/// Where the panel hangs from: the strip, or the tray icon.
+fn panel_anchor() -> Option<RECT> {
+    let app = app();
+    if app.config.get().tray {
+        return app.tray.borrow().as_ref().and_then(tray::Tray::rect);
+    }
+    let strip = app.overlay.get()?;
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(strip, &mut r).ok()? };
+    Some(r)
+}
+
 fn update_panel() {
     let app = app();
-    let (Some(snap), Some(strip), Some(tb)) = (latest(), app.overlay.get(), taskbar::find()) else {
+    let (Some(snap), Some(sr), Some(tb)) = (latest(), panel_anchor(), taskbar::find()) else {
         return;
     };
     let panel = match app.panel.get() {
@@ -902,10 +991,6 @@ fn update_panel() {
         return;
     };
     let tbr = taskbar::rect(tb);
-    let mut sr = RECT::default();
-    unsafe {
-        let _ = GetWindowRect(strip, &mut sr);
-    }
     let x = sr.left.clamp(tbr.left, (tbr.right - w).max(tbr.left));
     let gap = (6.0 * scale) as i32;
     // Above the taskbar, or below it when the taskbar is at the top of its screen.
@@ -1063,6 +1148,9 @@ fn separator(menu: HMENU) {
 fn display_menu() -> Option<HMENU> {
     let c = app().config.get();
     let m = unsafe { CreatePopupMenu().ok()? };
+    menu_item(m, true, !c.tray, ID_SHOW_STRIP, "Show in taskbar");
+    menu_item(m, true, c.tray, ID_SHOW_TRAY, "Tray icon only");
+    separator(m);
     for (i, l) in Layout::ALL.iter().enumerate() {
         menu_item(m, true, c.layout == *l, ID_LAYOUT + i, l.label());
     }
