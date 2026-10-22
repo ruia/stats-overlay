@@ -94,13 +94,14 @@ pub static LATEST: Mutex<Option<Snapshot>> = Mutex::new(None);
 /// Kept apart from Snapshot, which is Copy and refreshed 30x as often.
 pub static DISK: Mutex<Option<DiskSnap>> = Mutex::new(None);
 
-pub fn spawn(notify: HWND, cpu: bool, gpu: bool) {
+pub fn spawn(notify: HWND) {
     let notify = notify.0 as usize;
     let _ = std::thread::Builder::new()
         .stack_size(256 * 1024)
         .spawn(move || {
             let _ = SAMPLER.set(std::thread::current());
-            let pdh = metrics::Pdh::open(cpu, gpu);
+            let mut cpu_meter = metrics::Cpu::new();
+            let mut gpus = metrics::Gpus::open();
             let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
             let mut wsl_checked: Option<Instant> = None;
             let mut config_checked: Option<Instant> = None;
@@ -113,12 +114,8 @@ pub fn spawn(notify: HWND, cpu: bool, gpu: bool) {
             let mut last_vm_cpu: Option<(Instant, u64)> = None;
             loop {
                 let mut snap = sample();
-                if let Some(p) = &pdh {
-                    if p.collect() {
-                        snap.cpu = p.cpu();
-                        snap.gpu = p.gpu();
-                    }
-                }
+                snap.cpu = cpu_meter.sample();
+                snap.gpu = gpus.as_mut().and_then(metrics::Gpus::sample);
                 let now = Instant::now();
                 snap.wsl_cpu = match (snap.vm, last_vm_cpu) {
                     (Some(vm), Some((t, cpu))) if vm.cpu_time >= cpu => {

@@ -71,7 +71,6 @@ Output: `target\release\statsoverlay.exe`.
 | `statsoverlay.exe` | Embeds the strip in the taskbar (falls back to a topmost overlay if that fails). |
 | `statsoverlay.exe --popup` | Forces the fallback overlay mode. |
 | `statsoverlay.exe --offset 120` | Left offset in logical px, instead of the Widgets-button guess. |
-| `statsoverlay.exe --no-cpu` / `--no-gpu` | Turns the PDH CPU or GPU counters off (to measure their memory cost). |
 | `statsoverlay.exe --diag` | Writes `statsoverlay-diag.txt` next to the exe and opens it. |
 
 Left-click opens Task Manager. Right-click: Reclaim WSL cache (drops Linux's page
@@ -84,7 +83,7 @@ Display, Open Task Manager, Start with Windows (HKCU Run key), Exit. Only one in
 | --- | --- |
 | `src/main.rs` | Windows, message loop, placement, menu |
 | `src/sampler.rs` | Sampler thread: GlobalMemoryStatusEx, VM and compression accounting |
-| `src/metrics.rs` | PDH (CPU utility, GPU 3D engines, VRAM) and commit charge |
+| `src/metrics.rs` | CPU (system times x clock), GPU and VRAM (D3DKMT statistics), commit charge. No PDH: it costs ~4 MB |
 | `src/startup.rs` | Start with Windows |
 | `src/config.rs` | Display settings (layout, shown columns) in the registry |
 | `src/disk.rs` | Drives and WSL/Docker VHDX sizes |

@@ -1,141 +1,234 @@
-//! CPU, GPU and commit charge. Runs on the sampler thread only.
+//! CPU, GPU and commit charge, without PDH: loading PDH costs about 4 MB of
+//! working set, more than the rest of the app. Runs on the sampler thread only.
 //!
-//! CPU and GPU come from PDH, because that is where Task Manager's own numbers
-//! live: "% Processor Utility" (frequency-adjusted, can exceed 100 with turbo) and
-//! the per-engine GPU utilization. The query holds only these counters; the
-//! per-process memory that used to go through PDH now uses procs.rs.
+//! - CPU: system idle/kernel/user times, scaled by the current clock over the
+//!   base clock to approximate Task Manager's "% Processor Utility".
+//! - GPU: the kernel graphics statistics (D3DKMTQueryStatistics), the same source
+//!   Task Manager reads: per-engine running time and per-segment memory.
 
-use windows::core::{w, PCWSTR};
-use windows::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-    PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_FMT, PDH_FMT_COUNTERVALUE,
-    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
+use std::time::Instant;
+use windows::Wdk::Graphics::Direct3D::{
+    D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, D3DKMTQueryStatistics,
+    D3DKMT_ADAPTERINFO, D3DKMT_CLOSEADAPTER, D3DKMT_ENUMADAPTERS2, D3DKMT_QUERYADAPTERINFO,
+    D3DKMT_QUERYSTATISTICS, D3DKMT_QUERYSTATISTICS_ADAPTER, D3DKMT_QUERYSTATISTICS_NODE,
+    D3DKMT_QUERYSTATISTICS_SEGMENT, KMTQAITYPE_ADAPTERTYPE,
+};
+use windows::Win32::Foundation::{FILETIME, LUID};
+use windows::Win32::System::Power::{
+    CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION,
 };
 use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
-
-/// Double, without PDH's cap at 100 (PDH_FMT_NOCAP100): utility goes above 100
-/// under turbo and summed GPU engines can too; we clamp ourselves.
-const FMT: PDH_FMT = PDH_FMT(PDH_FMT_DOUBLE.0 | 0x8000);
-
-pub struct Pdh {
-    query: PDH_HQUERY,
-    cpu: Option<PDH_HCOUNTER>,
-    gpu: Option<PDH_HCOUNTER>,
-    vram: Option<PDH_HCOUNTER>,
-}
+use windows::Win32::System::Threading::GetSystemTimes;
 
 #[derive(Clone, Copy, Default)]
 pub struct Gpu {
-    /// Busiest adapter's 3D engine utilization, 0..=100.
+    /// Busiest engine of the busiest adapter, 0..=100 (Task Manager's GPU column).
     pub percent: f64,
-    /// Busiest adapter's dedicated memory in use.
+    /// Dedicated memory in use on the adapter with the most of it.
     pub vram: Option<u64>,
 }
 
-impl Pdh {
-    /// `--no-cpu` / `--no-gpu` turn counters off, to measure what each one costs.
-    pub fn open(cpu: bool, gpu: bool) -> Option<Pdh> {
-        if !cpu && !gpu {
-            return None;
-        }
-        unsafe {
-            let mut query = PDH_HQUERY::default();
-            if PdhOpenQueryW(None, 0, &mut query) != 0 {
-                return None;
-            }
-            let add = |path: PCWSTR| {
-                let mut c = PDH_HCOUNTER::default();
-                (PdhAddEnglishCounterW(query, path, 0, &mut c) == 0).then_some(c)
-            };
-            let p = Pdh {
-                query,
-                cpu: cpu
-                    .then(|| add(w!("\\Processor Information(_Total)\\% Processor Utility")))
-                    .flatten(),
-                gpu: gpu
-                    .then(|| add(w!("\\GPU Engine(*engtype_3D)\\Utilization Percentage")))
-                    .flatten(),
-                vram: gpu
-                    .then(|| add(w!("\\GPU Adapter Memory(*)\\Dedicated Usage")))
-                    .flatten(),
-            };
-            // Rate counters need a first sample to diff against.
-            PdhCollectQueryData(query);
-            Some(p)
-        }
+fn ft(t: FILETIME) -> u64 {
+    (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
+}
+
+pub struct Cpu {
+    last: Option<(u64, u64)>,
+    cpus: usize,
+}
+
+impl Cpu {
+    pub fn new() -> Cpu {
+        let mut c = Cpu {
+            last: None,
+            cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        };
+        c.sample(); // the first reading only sets the baseline
+        c
     }
 
-    pub fn collect(&self) -> bool {
-        unsafe { PdhCollectQueryData(self.query) == 0 }
+    /// % since the previous call, None on the first.
+    pub fn sample(&mut self) -> Option<f64> {
+        let (mut idle, mut kernel, mut user) = Default::default();
+        unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).ok()? };
+        // Kernel time includes idle time.
+        let (idle, total) = (ft(idle), ft(kernel) + ft(user));
+        let prev = self.last.replace((idle, total));
+        let (pi, pt) = prev?;
+        let dt = total.checked_sub(pt).filter(|&d| d > 0)?;
+        let busy = dt.saturating_sub(idle.saturating_sub(pi)) as f64 / dt as f64;
+        Some((busy * self.clock_ratio() * 100.0).clamp(0.0, 100.0))
     }
 
-    /// Clamped to 100: utility exceeds 100 when the CPU runs above base clock.
-    pub fn cpu(&self) -> Option<f64> {
-        let mut v = PDH_FMT_COUNTERVALUE::default();
-        let ok = unsafe { PdhGetFormattedCounterValue(self.cpu?, FMT, None, &mut v) } == 0;
-        (ok && v.CStatus == 0).then(|| unsafe { v.Anonymous.doubleValue }.clamp(0.0, 100.0))
-    }
-
-    pub fn gpu(&self) -> Option<Gpu> {
-        let engines = array(self.gpu?)?;
-        // Instance: pid_1234_luid_0x00000000_0x0000D1F2_phys_0_eng_0_engtype_3D.
-        // Sum all processes' 3D usage per adapter, report the busiest adapter.
-        let mut per_adapter: Vec<(String, f64)> = Vec::new();
-        for (name, v) in engines {
-            let key = adapter_key(&name);
-            match per_adapter.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, sum)) => *sum += v,
-                None => per_adapter.push((key, v)),
-            }
+    /// Average current clock over base clock; above 1 under turbo, below when
+    /// throttled. 1 when unknown.
+    fn clock_ratio(&self) -> f64 {
+        let mut info = vec![PROCESSOR_POWER_INFORMATION::default(); self.cpus];
+        let size = (info.len() * size_of::<PROCESSOR_POWER_INFORMATION>()) as u32;
+        let status = unsafe {
+            CallNtPowerInformation(
+                ProcessorInformation,
+                None,
+                0,
+                Some(info.as_mut_ptr().cast()),
+                size,
+            )
+        };
+        if status.is_err() {
+            return 1.0;
         }
-        let percent = per_adapter
-            .iter()
-            .map(|(_, v)| *v)
-            .fold(0.0, f64::max)
-            .min(100.0);
-        let vram = self
-            .vram
-            .and_then(array)
-            .and_then(|a| a.iter().map(|(_, v)| *v).reduce(f64::max))
-            .map(|v| v as u64);
-        Some(Gpu { percent, vram })
+        let (cur, max) = info.iter().fold((0u64, 0u64), |(c, m), p| {
+            (c + u64::from(p.CurrentMhz), m + u64::from(p.MaxMhz))
+        });
+        if cur == 0 || max == 0 {
+            1.0
+        } else {
+            cur as f64 / max as f64
+        }
     }
 }
 
-fn adapter_key(instance: &str) -> String {
-    let start = instance.find("luid_").unwrap_or(0);
-    let end = instance[start..]
-        .find("_phys")
-        .map_or(instance.len(), |e| start + e);
-    instance[start..end].to_string()
+struct Adapter {
+    luid: LUID,
+    nodes: u32,
+    segments: u32,
+    /// Per node: last running time (100 ns).
+    last: Vec<i64>,
 }
 
-fn array(counter: PDH_HCOUNTER) -> Option<Vec<(String, f64)>> {
+pub struct Gpus {
+    adapters: Vec<Adapter>,
+    last: Option<Instant>,
+}
+
+fn stats(q: &mut D3DKMT_QUERYSTATISTICS) -> bool {
+    unsafe { D3DKMTQueryStatistics(q).is_ok() }
+}
+
+fn query(luid: LUID) -> D3DKMT_QUERYSTATISTICS {
+    D3DKMT_QUERYSTATISTICS {
+        AdapterLuid: luid,
+        ..Default::default()
+    }
+}
+
+/// Hardware adapters (no Basic Render Driver), as LUIDs.
+fn adapters() -> Vec<LUID> {
+    let mut e = D3DKMT_ENUMADAPTERS2::default();
     unsafe {
-        let fmt = FMT;
-        let (mut size, mut count) = (0u32, 0u32);
-        PdhGetFormattedCounterArrayW(counter, fmt, &mut size, &mut count, None);
-        if size == 0 {
-            return Some(Vec::new());
+        if D3DKMTEnumAdapters2(&mut e).is_err() || e.NumAdapters == 0 {
+            return Vec::new();
         }
-        let mut buf = vec![0u64; (size as usize).div_ceil(8)];
-        let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
-        if PdhGetFormattedCounterArrayW(counter, fmt, &mut size, &mut count, Some(items)) != 0 {
+        let mut list = vec![D3DKMT_ADAPTERINFO::default(); e.NumAdapters as usize];
+        e.pAdapters = list.as_mut_ptr();
+        if D3DKMTEnumAdapters2(&mut e).is_err() {
+            return Vec::new();
+        }
+        list.truncate(e.NumAdapters as usize);
+        list.iter()
+            .filter_map(|a| {
+                // D3DKMT_ADAPTERTYPE bit 2: SoftwareDevice.
+                let mut kind = 0u32;
+                let mut q = D3DKMT_QUERYADAPTERINFO {
+                    hAdapter: a.hAdapter,
+                    Type: KMTQAITYPE_ADAPTERTYPE,
+                    pPrivateDriverData: (&mut kind as *mut u32).cast(),
+                    PrivateDriverDataSize: 4,
+                };
+                let software = D3DKMTQueryAdapterInfo(&mut q).is_ok() && kind & 4 != 0;
+                let _ = D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
+                    hAdapter: a.hAdapter,
+                });
+                (!software).then_some(a.AdapterLuid)
+            })
+            .collect()
+    }
+}
+
+impl Gpus {
+    pub fn open() -> Option<Gpus> {
+        let adapters: Vec<Adapter> = adapters()
+            .into_iter()
+            .filter_map(|luid| {
+                let mut q = query(luid);
+                q.Type = D3DKMT_QUERYSTATISTICS_ADAPTER;
+                stats(&mut q).then(|| {
+                    let a = unsafe { q.QueryResult.AdapterInformation };
+                    Adapter {
+                        luid,
+                        nodes: a.NodeCount,
+                        segments: a.NbSegments,
+                        last: Vec::new(),
+                    }
+                })
+            })
+            .collect();
+        if adapters.is_empty() {
             return None;
         }
-        let items = std::slice::from_raw_parts(items, count as usize);
-        Some(
-            items
-                .iter()
-                .filter(|it| it.FmtValue.CStatus == 0)
-                .map(|it| {
-                    (
-                        it.szName.to_string().unwrap_or_default(),
-                        it.FmtValue.Anonymous.doubleValue,
-                    )
-                })
-                .collect(),
-        )
+        let mut g = Gpus {
+            adapters,
+            last: None,
+        };
+        g.sample();
+        Some(g)
+    }
+
+    fn running_times(a: &Adapter) -> Vec<i64> {
+        (0..a.nodes)
+            .map(|n| {
+                let mut q = query(a.luid);
+                q.Type = D3DKMT_QUERYSTATISTICS_NODE;
+                q.Anonymous.QueryNode.NodeId = n;
+                if stats(&mut q) {
+                    unsafe { q.QueryResult.NodeInformation.GlobalInformation.RunningTime }
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
+
+    /// Dedicated (non-aperture) memory committed, as Task Manager and System
+    /// Informer count it.
+    fn dedicated(a: &Adapter) -> u64 {
+        (0..a.segments)
+            .filter_map(|s| {
+                let mut q = query(a.luid);
+                q.Type = D3DKMT_QUERYSTATISTICS_SEGMENT;
+                q.Anonymous.QuerySegment.SegmentId = s;
+                stats(&mut q).then_some(unsafe { q.QueryResult.SegmentInformation })
+            })
+            .filter(|seg| seg.Aperture == 0)
+            .map(|seg| seg.BytesCommitted)
+            .sum()
+    }
+
+    /// Utilization since the previous call (None on the first) and VRAM now.
+    pub fn sample(&mut self) -> Option<Gpu> {
+        let now = Instant::now();
+        let wall = self
+            .last
+            .replace(now)
+            .map(|t| now.duration_since(t).as_nanos() as f64 / 100.0);
+        let mut percent = 0f64;
+        let mut vram = None::<u64>;
+        for a in &mut self.adapters {
+            let times = Self::running_times(a);
+            if let Some(wall) = wall.filter(|&w| w > 0.0) {
+                for (t, p) in times.iter().zip(&a.last) {
+                    let busy = (t - p).max(0) as f64 / wall * 100.0;
+                    percent = percent.max(busy);
+                }
+            }
+            a.last = times;
+            let d = Self::dedicated(a);
+            vram = Some(vram.map_or(d, |v| v.max(d)));
+        }
+        wall.map(|_| Gpu {
+            percent: percent.min(100.0),
+            vram,
+        })
     }
 }
 

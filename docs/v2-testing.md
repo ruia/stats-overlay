@@ -49,7 +49,14 @@ sections).
 
 The hover panel and the menu should open below the taskbar.
 
-## Still open
+## 5. Memory and CPU/GPU without PDH
 
-The three `--no-cpu` / `--no-gpu` / `--no-cpu --no-gpu` memory readings from v1,
-to decide which PDH counter to replace.
+PDH is gone (it cost ~4 MB per counter set). Check:
+
+- Task Manager > Processes > statsoverlay.exe Memory: expected around 3.5-4 MB.
+- CPU: compare the strip with Task Manager > Performance > CPU "Utilization"
+  while idle and under load (e.g. a build). A few points of difference is
+  expected; tell me if it's consistently off by more than ~5.
+- GPU: compare with Task Manager > Performance > GPU (the big % is the busiest
+  engine) and "Dedicated GPU memory" against the panel's VRAM, e.g. while a
+  video or game runs.
