@@ -79,3 +79,17 @@ PDH is gone (it cost ~4 MB per counter set). Check:
 
 Open the right-click menu, close it, and the WSL settings Custom… box: memory
 should drop back to ~3.5-4 MB within a second instead of staying at ~7 MB.
+
+## 8. Strip, panel and tray settings (right-click > Display)
+
+- The Display menu now has three submenus: **Taskbar strip**, **Hover panel**,
+  **Tray icon**. Unticking CPU under Taskbar strip hides it from the strip only;
+  the panel keeps it (and vice versa).
+- **Hover panel > Style**: try each of the five. Check that nothing is cut off,
+  rows line up, and bars/graphs sit in the middle of their row.
+  - *Tiles*: three per row, big numbers.
+  - *History*: the graphs fill in from the right over a minute (30 samples).
+  - *Insights*: with no warnings it says "Nothing needs attention".
+- **Tray icon > second bar**: commit / system drive / CPU / RAM only.
+- Restart: every choice comes back. Memory stays around 3.5-4 MB, also with the
+  History panel (its buffer is under 1 KB).

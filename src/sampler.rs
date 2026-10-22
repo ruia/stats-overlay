@@ -6,7 +6,7 @@ use crate::metrics::{self, Gpu};
 use crate::procs::{self, ProcMem};
 use crate::wsl::{self, LinuxMem};
 use crate::wslconfig::{self, WslConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -91,6 +91,39 @@ impl Snapshot {
 }
 
 pub static LATEST: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+/// One point of the History panel's graphs; every value is a fraction 0..=1.
+#[derive(Clone, Copy, Default)]
+pub struct Sample {
+    pub win: f32,
+    pub wsl: f32,
+    pub commit: f32,
+    pub cpu: f32,
+    pub wsl_cpu: f32,
+    pub gpu: f32,
+}
+
+/// The last minute of samples, oldest first (30 × 24 bytes).
+pub const HISTORY_LEN: usize = 30;
+pub static HISTORY: Mutex<VecDeque<Sample>> = Mutex::new(VecDeque::new());
+
+fn record(s: &Snapshot) {
+    let frac = |a: u64, b: u64| a as f32 / b.max(1) as f32;
+    let cpu = s.cpu.unwrap_or(0.0) as f32 / 100.0;
+    let wsl_cpu = (s.wsl_cpu.unwrap_or(0.0) as f32 / 100.0).min(cpu);
+    let mut h = HISTORY.lock().unwrap();
+    if h.len() == HISTORY_LEN {
+        h.pop_front();
+    }
+    h.push_back(Sample {
+        win: frac(s.windows(), s.total),
+        wsl: frac(s.vm_ram(), s.total),
+        commit: s.commit.map_or(0.0, |(u, l)| frac(u, l)),
+        cpu,
+        wsl_cpu,
+        gpu: s.gpu.map_or(0.0, |g| g.percent as f32 / 100.0),
+    });
+}
 /// Kept apart from Snapshot, which is Copy and refreshed 30x as often.
 pub static DISK: Mutex<Option<DiskSnap>> = Mutex::new(None);
 
@@ -161,6 +194,7 @@ pub fn spawn(notify: HWND) {
                     }
                     *DISK.lock().unwrap() = Some(disk::read(|name| df.get(name).copied()));
                 }
+                record(&snap);
                 *LATEST.lock().unwrap() = Some(snap);
                 unsafe {
                     let _ =

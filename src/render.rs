@@ -34,12 +34,24 @@ use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 use windows_numerics::Vector2;
 
 /// A run of text drawn in one color. `bold` is used for values.
+#[derive(Clone)]
 pub struct Seg {
     pub text: String,
     pub color: D2D1_COLOR_F,
     pub bold: bool,
-    /// Set by `bar()`: the line is drawn as a bar instead of text.
+    /// Font size relative to the style's, for big numbers.
+    pub size: f32,
+    /// Set by `bar()` / `spark()`: the line is drawn as a graphic instead of text.
     pub bar: Option<Box<Bar>>,
+    pub spark: Option<Box<Spark>>,
+}
+
+/// A small history graph: one column per sample, series stacked bottom-up,
+/// each value a fraction 0..=1 of the graph's height.
+#[derive(Clone)]
+pub struct Spark {
+    pub series: Vec<(Vec<f32>, D2D1_COLOR_F)>,
+    pub track: D2D1_COLOR_F,
 }
 
 /// A thin horizontal bar as wide as its column: filled parts on a track.
@@ -55,8 +67,26 @@ pub fn seg(text: impl Into<String>, color: D2D1_COLOR_F, bold: bool) -> Seg {
         text: text.into(),
         color,
         bold,
+        size: 1.0,
         bar: None,
+        spark: None,
     }
+}
+
+/// A bold run at `size` times the normal font size.
+pub fn big(text: impl Into<String>, color: D2D1_COLOR_F, size: f32) -> Seg {
+    Seg {
+        size,
+        ..seg(text, color, true)
+    }
+}
+
+/// A line holding just a history graph.
+pub fn spark(series: Vec<(Vec<f32>, D2D1_COLOR_F)>, track: D2D1_COLOR_F) -> Vec<Seg> {
+    vec![Seg {
+        spark: Some(Box::new(Spark { series, track })),
+        ..seg("", track, false)
+    }]
 }
 
 /// A line holding just a bar.
@@ -65,17 +95,24 @@ pub fn bar(parts: Vec<(f32, D2D1_COLOR_F)>, track: D2D1_COLOR_F) -> Vec<Seg> {
         text: String::new(),
         color: track,
         bold: false,
+        size: 1.0,
         bar: Some(Box::new(Bar { parts, track })),
+        spark: None,
     }]
 }
 
 /// Narrowest a bar gets, and its thickness.
 const BAR_MIN_DIP: f32 = 64.0;
 const BAR_H_DIP: f32 = 4.0;
+/// History graph size: width, and height in normal lines.
+const SPARK_W_DIP: f32 = 140.0;
+const SPARK_LINES: f32 = 2.0;
 
 enum Line {
-    Text(IDWriteTextLayout),
+    /// Layout and its height.
+    Text(IDWriteTextLayout, f32),
     Bar(Bar),
+    Spark(Spark),
 }
 
 /// A column of lines.
@@ -105,7 +142,10 @@ pub struct Renderer {
     scale: f32,
     widths: Vec<f32>,
     columns: Vec<Vec<Line>>,
+    /// Height of a normal line of text.
     line_h: f32,
+    /// Height of each row (the tallest line at that index across columns).
+    rows: Vec<f32>,
 }
 
 impl Renderer {
@@ -141,6 +181,7 @@ impl Renderer {
                 widths: Vec::new(),
                 columns: Vec::new(),
                 line_h: 0.0,
+                rows: Vec::new(),
             })
         }
     }
@@ -190,22 +231,36 @@ impl Renderer {
         }
         let fmt = self.format(self.style.font_dip * scale)?;
         self.columns.clear();
-        self.line_h = 0.0;
+        self.line_h = {
+            let probe = self.layout(&[seg("0", D2D1_COLOR_F::default(), false)], &fmt)?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            unsafe { probe.GetMetrics(&mut m)? };
+            m.height
+        };
+        self.rows.clear();
         for (i, col) in cols.iter().enumerate() {
             let mut layouts = Vec::new();
             let mut width = 0f32;
-            for segs in col {
-                if let Some(b) = segs.first().and_then(|s| s.bar.as_deref()) {
-                    width = width.max(BAR_MIN_DIP * scale);
-                    layouts.push(Line::Bar(b.clone()));
-                    continue;
+            for (row, segs) in col.iter().enumerate() {
+                let first = segs.first();
+                let (line, w, h) = if let Some(b) = first.and_then(|s| s.bar.as_deref()) {
+                    (Line::Bar(b.clone()), BAR_MIN_DIP * scale, self.line_h)
+                } else if let Some(sp) = first.and_then(|s| s.spark.as_deref()) {
+                    let h = self.line_h * SPARK_LINES;
+                    (Line::Spark(sp.clone()), SPARK_W_DIP * scale, h)
+                } else {
+                    let layout = self.layout(segs, &fmt)?;
+                    let mut m = DWRITE_TEXT_METRICS::default();
+                    unsafe { layout.GetMetrics(&mut m)? };
+                    let (w, h) = (m.widthIncludingTrailingWhitespace, m.height);
+                    (Line::Text(layout, h), w, h)
+                };
+                width = width.max(w);
+                if self.rows.len() <= row {
+                    self.rows.push(0.0);
                 }
-                let layout = self.layout(segs, &fmt)?;
-                let mut m = DWRITE_TEXT_METRICS::default();
-                unsafe { layout.GetMetrics(&mut m)? };
-                width = width.max(m.widthIncludingTrailingWhitespace);
-                self.line_h = self.line_h.max(m.height);
-                layouts.push(Line::Text(layout));
+                self.rows[row] = self.rows[row].max(h);
+                layouts.push(line);
             }
             self.widths[i] = if self.style.sticky_widths {
                 self.widths[i].max(width)
@@ -216,9 +271,9 @@ impl Renderer {
         }
         let pad = self.style.pad_dip * scale;
         let gap = self.style.gap_dip * scale;
-        let lines = self.columns.iter().map(Vec::len).max().unwrap_or(0) as f32;
+        let content_h: f32 = self.rows.iter().sum();
         let w = self.widths.iter().sum::<f32>() + gap * (cols.len().max(1) - 1) as f32 + 2.0 * pad;
-        let h = height.unwrap_or((self.line_h * lines + 2.0 * pad).ceil() as i32);
+        let h = height.unwrap_or((content_h + 2.0 * pad).ceil() as i32);
         self.ensure_bitmap(w.ceil() as i32, h)?;
         Ok(self.size)
     }
@@ -238,6 +293,9 @@ impl Renderer {
                 layout.SetDrawingEffect(&brush, range)?;
                 if s.bold {
                     layout.SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, range)?;
+                }
+                if s.size != 1.0 {
+                    layout.SetFontSize(fmt.GetFontSize() * s.size, range)?;
                 }
             }
             start += len;
@@ -325,19 +383,45 @@ impl Renderer {
                 }
             }
             let brush = self.rt.CreateSolidColorBrush(&fallback_color, None)?;
-            let lines = self.columns.iter().map(Vec::len).max().unwrap_or(0) as f32;
-            let top = ((h as f32 - self.line_h * lines) / 2.0).max(0.0).round();
+            let content_h: f32 = self.rows.iter().sum();
+            let top = ((h as f32 - content_h) / 2.0).max(0.0).round();
+            let row_tops: Vec<f32> = self
+                .rows
+                .iter()
+                .scan(top, |y, rh| {
+                    let t = *y;
+                    *y += rh;
+                    Some(t)
+                })
+                .collect();
             let mut x = pad;
             for (col, width) in self.columns.iter().zip(&self.widths) {
                 for (i, l) in col.iter().enumerate() {
-                    let y = top + self.line_h * i as f32;
+                    // Each line is centered vertically in its row.
+                    let (y, rh) = (row_tops[i], self.rows[i]);
                     match l {
-                        Line::Text(l) => {
-                            let origin = Vector2 { X: x.round(), Y: y };
+                        Line::Text(l, lh) => {
+                            let origin = Vector2 {
+                                X: x.round(),
+                                Y: (y + (rh - lh) / 2.0).round(),
+                            };
                             self.rt
                                 .DrawTextLayout(origin, l, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
                         }
-                        Line::Bar(b) => self.draw_bar(b, x.round(), y, *width)?,
+                        Line::Bar(b) => {
+                            let y = y + (rh - self.line_h) / 2.0;
+                            self.draw_bar(b, x.round(), y, *width)?
+                        }
+                        Line::Spark(sp) => {
+                            let sh = self.line_h * SPARK_LINES;
+                            self.draw_spark(
+                                sp,
+                                x.round(),
+                                (y + (rh - sh) / 2.0).round(),
+                                *width,
+                                sh,
+                            )?
+                        }
                     }
                 }
                 x += width + gap;
@@ -369,6 +453,48 @@ impl Renderer {
 }
 
 impl Renderer {
+    /// Columns of stacked samples, right-aligned so the newest is at the right edge.
+    unsafe fn draw_spark(&self, sp: &Spark, x: f32, y: f32, width: f32, h: f32) -> Result<()> {
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + h,
+        };
+        self.rt
+            .FillRectangle(&rect, &self.rt.CreateSolidColorBrush(&sp.track, None)?);
+        let n = sp.series.iter().map(|(v, _)| v.len()).max().unwrap_or(0);
+        if n == 0 {
+            return Ok(());
+        }
+        let col_w = (width / 30.0).max(1.0);
+        let brushes: Vec<_> = sp
+            .series
+            .iter()
+            .map(|(_, c)| self.rt.CreateSolidColorBrush(c, None))
+            .collect::<Result<_>>()?;
+        for i in 0..n {
+            let left = x + width - (n - i) as f32 * col_w;
+            if left < x {
+                continue;
+            }
+            let mut bottom = y + h;
+            for ((values, _), brush) in sp.series.iter().zip(&brushes) {
+                let v = values.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let top = (bottom - v * h).max(y);
+                let r = D2D_RECT_F {
+                    left,
+                    top,
+                    right: left + col_w - 1.0,
+                    bottom,
+                };
+                self.rt.FillRectangle(&r, brush);
+                bottom = top;
+            }
+        }
+        Ok(())
+    }
+
     /// A bar centered in the line slot at `y`. Call between BeginDraw and EndDraw.
     unsafe fn draw_bar(&self, b: &Bar, x: f32, y: f32, width: f32) -> Result<()> {
         let h = (BAR_H_DIP * self.scale).round().max(2.0);

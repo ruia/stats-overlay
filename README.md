@@ -61,16 +61,24 @@ Manager uses.
 
 Right-click the strip:
 
-- **Display**: show in the taskbar, as a tray icon, or both; pick the layout;
-  and toggle CPU, GPU, commit and disk.
-  - *Tray icon*: two small bars (RAM split Windows / WSL, and commit); hover
-    for the panel, right-click for the menu. "Keep tray icon visible" pins it
-    next to the clock instead of under ^ (the same switch as Settings >
-    Personalization > Taskbar > Other system tray icons).
-  - *Grid*: two lines per metric (shown above).
-  - *Windows / WSL rows*: one row each, with RAM, disk and CPU side by side.
-  - *Bars*: one column per resource, with a bar split Windows (blue) / WSL (orange).
-  - *Compact*: just WIN and WSL memory.
+- **Display**: show in the taskbar, as a tray icon, or both. The strip, the
+  hover panel and the tray icon each have their own settings:
+  - **Taskbar strip**: the layout, and which of CPU, GPU, commit and disk it shows.
+    - *Grid*: two lines per metric (shown above).
+    - *Windows / WSL rows*: one row each, with RAM, disk and CPU side by side.
+    - *Bars*: one column per resource, with a bar split Windows (blue) / WSL (orange).
+    - *Compact*: just WIN and WSL memory.
+  - **Hover panel**: the style, and its own CPU / GPU / commit / disk toggles.
+    - *Sections*: every detail, grouped into Memory, WSL, Disk and CPU · GPU.
+    - *Bars*: a Windows / WSL bar per resource, with a legend.
+    - *Tiles*: big numbers, three per row.
+    - *History*: each value next to a graph of the last minute.
+    - *Insights*: a one-line summary, then only what needs attention and why.
+  - **Tray icon**: two small bars, RAM (Windows / WSL) and a second one you pick
+    (commit, system drive, CPU, or none). Hover for the panel, right-click for
+    the menu. "Keep visible" pins it next to the clock instead of under ^ (the
+    same switch as Settings > Personalization > Taskbar > Other system tray
+    icons).
 - **WSL settings**: edits `%USERPROFILE%\.wslconfig` in place (other lines and
   comments are kept; the original is backed up once to
   `.wslconfig.statsoverlay-backup`):

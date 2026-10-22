@@ -31,7 +31,7 @@ mod util;
 mod wsl;
 mod wslconfig;
 
-use config::{Config, Layout, Show, Toggle};
+use config::{Config, Layout, PanelStyle, Show, Toggle, TraySecond};
 use disk::DiskSnap;
 use render::{bar, seg, Column, Renderer, Seg, Style};
 use sampler::{Snapshot, WslState, WM_APP_SAMPLE};
@@ -41,6 +41,7 @@ use theme::Palette;
 use util::{gib, wide, GIB};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -78,6 +79,12 @@ const ID_TOGGLE: usize = 110;
 const ID_RECLAIM_MODE: usize = 120;
 /// + index into MEMORY_CHOICES.
 const ID_MEMORY: usize = 130;
+/// + index into Toggle::ALL, for the panel.
+const ID_PANEL_TOGGLE: usize = 150;
+/// + index into PanelStyle::ALL.
+const ID_PANEL_STYLE: usize = 160;
+/// + index into TraySecond::ALL.
+const ID_TRAY_SECOND: usize = 170;
 
 const RECLAIM_CHOICES: [(Reclaim, &str); 4] = [
     (Reclaim::NotSet, "Not set (WSL default)"),
@@ -326,7 +333,28 @@ fn command(hwnd: HWND, id: usize) {
         id @ ID_TOGGLE..ID_RECLAIM_MODE => {
             if let Some(&t) = Toggle::ALL.get(id - ID_TOGGLE) {
                 let mut c = app.config.get();
-                c.flip(t);
+                c.flip_strip(t);
+                set_config(c);
+            }
+        }
+        id @ ID_PANEL_TOGGLE..ID_PANEL_STYLE => {
+            if let Some(&t) = Toggle::ALL.get(id - ID_PANEL_TOGGLE) {
+                let mut c = app.config.get();
+                c.flip_panel(t);
+                set_config(c);
+            }
+        }
+        id @ ID_PANEL_STYLE..ID_TRAY_SECOND => {
+            if let Some(&st) = PanelStyle::ALL.get(id - ID_PANEL_STYLE) {
+                let mut c = app.config.get();
+                c.set_style(st);
+                set_config(c);
+            }
+        }
+        id @ ID_TRAY_SECOND..180 => {
+            if let Some(&t) = TraySecond::ALL.get(id - ID_TRAY_SECOND) {
+                let mut c = app.config.get();
+                c.set_tray_second(t);
                 set_config(c);
             }
         }
@@ -629,7 +657,7 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
         None => none(),
     };
     let gpu = || percent(s.gpu.map(|g| g.percent));
-    let system = d.and_then(DiskSnap::system).filter(|_| c.disk);
+    let system = d.and_then(DiskSnap::system).filter(|_| c.strip.disk);
     let vhd = |line: &mut Vec<Seg>| {
         if let Some(d) = d {
             line.push(seg(gib(d.vhd_total()), p.value, true));
@@ -659,14 +687,14 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
                     ),
                 ]],
             ];
-            if c.commit {
+            if c.strip.commit {
                 cols[1].push(vec![label("CMT "), commit()]);
             }
             let mut cg = Vec::new();
-            if c.cpu {
+            if c.strip.cpu {
                 cg.push(vec![label("CPU "), percent(s.cpu)]);
             }
-            if c.gpu {
+            if c.strip.gpu {
                 cg.push(vec![label("GPU "), gpu()]);
             }
             cols.push(cg);
@@ -731,17 +759,17 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
                     ),
                 ]);
             }
-            if let (true, Some((u, l))) = (c.commit, s.commit) {
+            if let (true, Some((u, l))) = (c.strip.commit, s.commit) {
                 cols.push(vec![
                     vec![label("CMT "), commit()],
                     bar(vec![(f(u, l), theme::level(p, frac(u, l)))], p.track),
                 ]);
             }
             let mut cg = Vec::new();
-            if c.cpu {
+            if c.strip.cpu {
                 cg.push(vec![label("CPU "), percent(s.cpu)]);
             }
-            if c.gpu {
+            if c.strip.gpu {
                 cg.push(vec![label("GPU "), gpu()]);
             }
             cols.push(cg);
@@ -767,7 +795,7 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
                     v,
                 ]);
             }
-            if c.cpu {
+            if c.strip.cpu {
                 let win = s.cpu.map(|t| (t - s.wsl_cpu.unwrap_or(0.0)).max(0.0));
                 let wsl = s.wsl_cpu.or(s.vm.is_none().then_some(0.0));
                 cols.push(vec![
@@ -776,10 +804,10 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
                 ]);
             }
             let mut extra = Vec::new();
-            if c.commit {
+            if c.strip.commit {
                 extra.push(vec![label("CMT "), commit()]);
             }
-            if c.gpu {
+            if c.strip.gpu {
                 extra.push(vec![label("GPU "), gpu()]);
             }
             cols.push(extra);
@@ -790,9 +818,26 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
     cols
 }
 
-/// The hover breakdown in sections; a label column and a value column.
-/// Display > CPU / GPU / Commit / Disk apply here as well as to the strip.
+/// The hover panel in the style picked in Display > Hover panel. Its CPU / GPU /
+/// Commit / Disk toggles are separate from the strip's.
 fn panel_columns(
+    s: &Snapshot,
+    d: Option<&DiskSnap>,
+    c: &Config,
+    p: &Palette,
+    embedded: bool,
+) -> Vec<Column> {
+    match c.style {
+        PanelStyle::Sections => sections_panel(s, d, c, p, embedded),
+        PanelStyle::Bars => bars_panel(s, d, c, p),
+        PanelStyle::Tiles => tiles_panel(s, d, c, p),
+        PanelStyle::History => history_panel(s, d, c, p),
+        PanelStyle::Insights => insights_panel(s, d, c, p),
+    }
+}
+
+/// Sections: a label column and a value column, grouped by resource.
+fn sections_panel(
     s: &Snapshot,
     d: Option<&DiskSnap>,
     c: &Config,
@@ -840,7 +885,7 @@ fn panel_columns(
         ),
         None => row(l("   WSL VM"), vec![dim("off".into())]),
     }
-    if let (true, Some((c, lim))) = (c.commit, s.commit) {
+    if let (true, Some((c, lim))) = (c.panel.commit, s.commit) {
         let f = c as f64 / lim.max(1) as f64;
         let mut val = vec![
             seg(format!("{} / {}", g(c), g(lim)), theme::level(p, f), true),
@@ -882,11 +927,11 @@ fn panel_columns(
             ],
         },
     );
-    if let (true, Some(w)) = (c.cpu, s.wsl_cpu) {
+    if let (true, Some(w)) = (c.panel.cpu, s.wsl_cpu) {
         row(l("CPU"), vec![v(pct(w))]);
     }
 
-    if let (true, Some(d)) = (c.disk, d) {
+    if let (true, Some(d)) = (c.panel.disk, d) {
         row(l(""), vec![]);
         row(head("DISK"), vec![]);
         for drive in &d.drives {
@@ -927,10 +972,10 @@ fn panel_columns(
         }
     }
 
-    if c.cpu || c.gpu {
+    if c.panel.cpu || c.panel.gpu {
         row(l(""), vec![]);
         row(
-            head(match (c.cpu, c.gpu) {
+            head(match (c.panel.cpu, c.panel.gpu) {
                 (true, true) => "CPU · GPU",
                 (true, false) => "CPU",
                 _ => "GPU",
@@ -938,10 +983,10 @@ fn panel_columns(
             vec![],
         );
     }
-    if c.cpu {
+    if c.panel.cpu {
         row(l("CPU"), vec![v(s.cpu.map_or("–".into(), pct))]);
     }
-    if c.gpu {
+    if c.panel.gpu {
         let mut gpu = vec![v(s.gpu.map_or("–".into(), |x| pct(x.percent)))];
         if let Some(vram) = s.gpu.and_then(|x| x.vram) {
             gpu.push(dim(format!("  VRAM {}", g(vram))));
@@ -957,21 +1002,585 @@ fn panel_columns(
     vec![labels, values]
 }
 
-/// The tray icon's second bar: commit, else the system drive, as Display allows.
+/// One decimal place: "41.9G".
+fn g1(b: u64) -> String {
+    format!("{:.1}G", b as f64 / GIB)
+}
+
+/// A WSL summary line shared by several styles: "Linux used 24.1G · reclaim gradual · limit 41.7G".
+fn wsl_summary(s: &Snapshot, c: &Config) -> String {
+    let mut parts = Vec::new();
+    match (s.wsl_state, s.linux) {
+        (WslState::Off, _) => parts.push("VM off".to_string()),
+        (WslState::Running, Some(m)) => parts.push(format!(
+            "Linux used {} · cache {}",
+            g1(m.used()),
+            g1(m.cache)
+        )),
+        _ => parts.push("no distro running".to_string()),
+    }
+    if let (true, Some(w)) = (c.panel.cpu, s.wsl_cpu) {
+        parts.push(format!("CPU {}", pct(w)));
+    }
+    let wc = s.wslconfig;
+    parts.push(format!("reclaim {}", wc.reclaim.label()));
+    parts.push(match wc.memory {
+        Some(m) => format!("limit {}", gib(m)),
+        None => "no limit".to_string(),
+    });
+    parts.join(" · ")
+}
+
+/// Bars: one section per resource, a Windows / WSL bar with a legend under it.
+///
+/// ```text
+/// MEMORY
+/// 41.9G of 63.9G in use                 66%
+/// [■■■■■■■ win ■■■■■■■ wsl ---------]
+/// ■ Windows 20.2G   ■ WSL 21.7G (6.7G RAM + 15.0G compressed)
+/// ```
+fn bars_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -> Vec<Column> {
+    let mut col: Column = Vec::new();
+    let l = |t: &str| seg(t, p.label, false);
+    let v = |t: String| seg(t, p.value, true);
+    let head = |t: &str| vec![seg(t, p.label, true)];
+    let key = |color| seg("■ ", color, false);
+    let frac = |a: u64, b: u64| a as f64 / b.max(1) as f64;
+    let f = |a: u64, b: u64| frac(a, b) as f32;
+
+    col.push(head("MEMORY"));
+    let ram = frac(s.used, s.total);
+    col.push(vec![
+        seg(g1(s.used), theme::level(p, ram), true),
+        l(&format!(
+            " of {} in use   {}",
+            g1(s.total),
+            pct(ram * 100.0)
+        )),
+    ]);
+    col.extend([bar(
+        vec![
+            (f(s.windows(), s.total), p.win),
+            (f(s.vm_ram(), s.total), p.wsl),
+        ],
+        p.track,
+    )]);
+    let mut legend = vec![key(p.win), l("Windows "), v(g1(s.windows())), l("    ")];
+    legend.push(key(p.wsl));
+    legend.push(l("WSL "));
+    match s.vm {
+        Some(vm) => {
+            legend.push(v(g1(s.vm_ram())));
+            legend.push(l(&format!(
+                "  ({} RAM + {} compressed)",
+                g1(vm.working_set),
+                g1(s.vm_compressed())
+            )));
+        }
+        None => legend.push(l("off")),
+    }
+    col.push(legend);
+    if let (true, Some((u, lim))) = (c.panel.commit, s.commit) {
+        let fr = frac(u, lim);
+        col.push(vec![]);
+        let mut line = vec![
+            l("Commit  "),
+            seg(
+                format!("{} / {}", g1(u), g1(lim)),
+                theme::level(p, fr),
+                true,
+            ),
+            l(&format!("   {}", pct(fr * 100.0))),
+        ];
+        if let Some(vm) = s.vm {
+            line.push(l(&format!(" · VM holds {}", g1(vm.private))));
+        }
+        col.push(line);
+        col.push(bar(vec![(fr as f32, theme::level(p, fr))], p.track));
+    }
+
+    if let (true, Some(d)) = (c.panel.disk, d) {
+        for drive in &d.drives {
+            let vhds: Vec<_> = d
+                .vhds
+                .iter()
+                .filter(|x| x.drive() == Some(drive.letter))
+                .collect();
+            let vhd_sum: u64 = vhds.iter().map(|x| x.on_disk).sum();
+            let fr = frac(drive.used(), drive.total);
+            col.push(vec![]);
+            col.push(head(&format!("DISK · {}:", drive.letter)));
+            col.push(vec![
+                seg(gib(drive.used()), theme::level(p, fr), true),
+                l(&format!(
+                    " of {}   {} free",
+                    gib(drive.total),
+                    gib(drive.free)
+                )),
+            ]);
+            col.push(bar(
+                vec![
+                    (f(d.windows_used(drive), drive.total), p.win),
+                    (f(vhd_sum, drive.total), p.wsl),
+                ],
+                p.track,
+            ));
+            let mut legend = vec![
+                key(p.win),
+                l("Windows "),
+                v(gib(d.windows_used(drive))),
+                l("    "),
+                key(p.wsl),
+                l("WSL disks "),
+                v(gib(vhd_sum)),
+            ];
+            let reclaim: u64 = vhds.iter().filter_map(|x| x.reclaimable()).sum();
+            if reclaim >= 1 << 30 {
+                legend.push(l(&format!("   ↓{} reclaimable", gib(reclaim))));
+            }
+            col.push(legend);
+            if !vhds.is_empty() {
+                let names: Vec<String> = vhds
+                    .iter()
+                    .map(|x| match x.linux_used {
+                        Some(u) => format!("{} {} (Linux {})", x.name, gib(x.on_disk), gib(u)),
+                        None => format!("{} {}", x.name, gib(x.on_disk)),
+                    })
+                    .collect();
+                col.push(vec![l(&names.join(" · "))]);
+            }
+        }
+    }
+
+    col.push(vec![]);
+    col.push(head("WSL"));
+    col.push(vec![l(&wsl_summary(s, c))]);
+
+    let mut meter = |name: &str, v: Option<f64>, extra: String| {
+        col.push(vec![]);
+        let fr = v.unwrap_or(0.0) / 100.0;
+        col.push(vec![
+            l(&format!("{name}  ")),
+            seg(v.map_or("–".into(), pct), theme::level(p, fr), true),
+            l(&extra),
+        ]);
+        col.push(bar(vec![(fr as f32, theme::level(p, fr))], p.track));
+    };
+    if c.panel.cpu {
+        let extra = s
+            .wsl_cpu
+            .map_or(String::new(), |w| format!("   WSL {}", pct(w)));
+        meter("CPU", s.cpu, extra);
+    }
+    if c.panel.gpu {
+        let extra = s
+            .gpu
+            .and_then(|x| x.vram)
+            .map_or(String::new(), |v| format!("   VRAM {}", g1(v)));
+        meter("GPU", s.gpu.map(|x| x.percent), extra);
+    }
+    vec![col]
+}
+
+/// Tiles: three per row, each a caption, a big number, a bar and a detail line.
+fn tiles_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -> Vec<Column> {
+    struct Tile {
+        caption: String,
+        value: Seg,
+        bar: Vec<Seg>,
+        detail: String,
+    }
+    let frac = |a: u64, b: u64| a as f64 / b.max(1) as f64;
+    let big_at = |t: String, fr: f64| render::big(t, theme::level(p, fr), 1.8);
+    let one = |fr: f64| bar(vec![(fr as f32, theme::level(p, fr))], p.track);
+    let ram = frac(s.used, s.total);
+    let ram_bar = || {
+        bar(
+            vec![
+                (frac(s.windows(), s.total) as f32, p.win),
+                (frac(s.vm_ram(), s.total) as f32, p.wsl),
+            ],
+            p.track,
+        )
+    };
+    let mut tiles = vec![
+        Tile {
+            caption: "WINDOWS RAM".into(),
+            value: render::big(g1(s.windows()), p.win, 1.8),
+            bar: ram_bar(),
+            detail: format!("{} of {} in use", pct(ram * 100.0), g1(s.total)),
+        },
+        Tile {
+            caption: "WSL RAM".into(),
+            value: match s.vm {
+                Some(_) => render::big(g1(s.vm_ram()), p.wsl, 1.8),
+                None => render::big("off", p.label, 1.8),
+            },
+            bar: ram_bar(),
+            detail: match s.vm {
+                Some(vm) => format!(
+                    "{} RAM + {} compressed",
+                    g1(vm.working_set),
+                    g1(s.vm_compressed())
+                ),
+                None => "VM not running".into(),
+            },
+        },
+    ];
+    if let (true, Some((u, lim))) = (c.panel.commit, s.commit) {
+        let fr = frac(u, lim);
+        let mut detail = format!("{} / {}", g1(u), g1(lim));
+        if let Some(vm) = s.vm {
+            detail.push_str(&format!(" · VM {}", g1(vm.private)));
+        }
+        tiles.push(Tile {
+            caption: "COMMIT".into(),
+            value: big_at(pct(fr * 100.0), fr),
+            bar: one(fr),
+            detail,
+        });
+    }
+    if let (true, Some(d)) = (c.panel.disk, d) {
+        if let Some(sys) = d.system() {
+            let fr = frac(sys.used(), sys.total);
+            let vhds: u64 = d
+                .vhds
+                .iter()
+                .filter(|x| x.drive() == Some(sys.letter))
+                .map(|x| x.on_disk)
+                .sum();
+            tiles.push(Tile {
+                caption: format!("{}: DRIVE", sys.letter),
+                value: big_at(gib(sys.used()), fr),
+                bar: bar(
+                    vec![
+                        (frac(d.windows_used(&sys), sys.total) as f32, p.win),
+                        (frac(vhds, sys.total) as f32, p.wsl),
+                    ],
+                    p.track,
+                ),
+                detail: format!("{} free · WSL {}", gib(sys.free), gib(vhds)),
+            });
+        }
+    }
+    if c.panel.cpu {
+        let fr = s.cpu.unwrap_or(0.0) / 100.0;
+        tiles.push(Tile {
+            caption: "CPU".into(),
+            value: big_at(s.cpu.map_or("–".into(), pct), fr),
+            bar: one(fr),
+            detail: s
+                .wsl_cpu
+                .map_or("WSL –".into(), |w| format!("WSL {}", pct(w))),
+        });
+    }
+    if c.panel.gpu {
+        let fr = s.gpu.map_or(0.0, |x| x.percent) / 100.0;
+        tiles.push(Tile {
+            caption: "GPU".into(),
+            value: big_at(s.gpu.map_or("–".into(), |x| pct(x.percent)), fr),
+            bar: one(fr),
+            detail: s
+                .gpu
+                .and_then(|x| x.vram)
+                .map_or(String::new(), |v| format!("VRAM {}", g1(v))),
+        });
+    }
+
+    let mut cols: Vec<Column> = vec![Vec::new(), Vec::new(), Vec::new()];
+    for (row, chunk) in tiles.chunks(3).enumerate() {
+        for (i, col) in cols.iter_mut().enumerate() {
+            if row > 0 {
+                col.push(vec![]);
+            }
+            match chunk.get(i) {
+                Some(t) => {
+                    col.push(vec![seg(t.caption.as_str(), p.label, true)]);
+                    col.push(vec![t.value.clone()]);
+                    col.push(t.bar.clone());
+                    col.push(vec![seg(t.detail.as_str(), p.label, false)]);
+                }
+                None => col.extend((0..4).map(|_| vec![])),
+            }
+        }
+    }
+    // The WSL line, split across the three columns so it doesn't widen the first.
+    let wc = s.wslconfig;
+    let linux = match (s.wsl_state, s.linux) {
+        (WslState::Running, Some(m)) => format!("Linux used {}", g1(m.used())),
+        (WslState::Off, _) => "WSL off".into(),
+        _ => "no distro running".into(),
+    };
+    let footer = [
+        linux,
+        format!("reclaim {}", wc.reclaim.label()),
+        wc.memory
+            .map_or("no memory limit".into(), |m| format!("limit {}", gib(m))),
+    ];
+    for (col, text) in cols.iter_mut().zip(footer) {
+        col.push(vec![]);
+        col.push(vec![seg(text, p.label, false)]);
+    }
+    cols
+}
+
+/// History: each metric's value next to a graph of the last minute.
+fn history_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -> Vec<Column> {
+    let hist: Vec<sampler::Sample> = sampler::HISTORY.lock().unwrap().iter().copied().collect();
+    let series = |f: fn(&sampler::Sample) -> f32| hist.iter().map(f).collect::<Vec<f32>>();
+    let (mut text, mut graph): (Column, Column) = (Vec::new(), Vec::new());
+    let frac = |a: u64, b: u64| a as f64 / b.max(1) as f64;
+    let l = |t: String| seg(t, p.label, false);
+    let mut row = |segs: Vec<Seg>, g: Vec<Seg>| {
+        text.push(segs);
+        graph.push(g);
+    };
+
+    row(
+        vec![seg("LAST 60 SECONDS", p.label, true)],
+        vec![seg(format!("{} samples", hist.len()), p.label, false)],
+    );
+    let ram = frac(s.used, s.total);
+    let wsl = match s.vm {
+        Some(_) => g1(s.vm_ram()),
+        None => "off".into(),
+    };
+    row(vec![], vec![]);
+    row(
+        vec![
+            l("Memory  ".into()),
+            seg(
+                format!("{} / {}", g1(s.used), g1(s.total)),
+                theme::level(p, ram),
+                true,
+            ),
+            l(format!("\nWindows {} · WSL {}", g1(s.windows()), wsl)),
+        ],
+        render::spark(
+            vec![(series(|x| x.win), p.win), (series(|x| x.wsl), p.wsl)],
+            p.track,
+        ),
+    );
+    if let (true, Some((u, lim))) = (c.panel.commit, s.commit) {
+        let fr = frac(u, lim);
+        let mut detail = format!("\n{} / {}", g1(u), g1(lim));
+        if let Some(vm) = s.vm {
+            detail.push_str(&format!(" · VM holds {}", g1(vm.private)));
+        }
+        row(vec![], vec![]);
+        row(
+            vec![
+                l("Commit  ".into()),
+                seg(pct(fr * 100.0), theme::level(p, fr), true),
+                l(detail),
+            ],
+            render::spark(vec![(series(|x| x.commit), theme::level(p, fr))], p.track),
+        );
+    }
+    if c.panel.cpu {
+        let fr = s.cpu.unwrap_or(0.0) / 100.0;
+        row(vec![], vec![]);
+        row(
+            vec![
+                l("CPU  ".into()),
+                seg(s.cpu.map_or("–".into(), pct), theme::level(p, fr), true),
+                l(format!("\nWSL {}", s.wsl_cpu.map_or("–".into(), pct))),
+            ],
+            render::spark(
+                vec![
+                    (series(|x| x.cpu - x.wsl_cpu), p.win),
+                    (series(|x| x.wsl_cpu), p.wsl),
+                ],
+                p.track,
+            ),
+        );
+    }
+    if c.panel.gpu {
+        let fr = s.gpu.map_or(0.0, |x| x.percent) / 100.0;
+        row(vec![], vec![]);
+        row(
+            vec![
+                l("GPU  ".into()),
+                seg(
+                    s.gpu.map_or("–".into(), |x| pct(x.percent)),
+                    theme::level(p, fr),
+                    true,
+                ),
+                l(format!(
+                    "\nVRAM {}",
+                    s.gpu.and_then(|x| x.vram).map_or("–".into(), g1)
+                )),
+            ],
+            render::spark(vec![(series(|x| x.gpu), p.win)], p.track),
+        );
+    }
+    if let (true, Some(sys), Some(d)) = (c.panel.disk, d.and_then(DiskSnap::system), d) {
+        let fr = frac(sys.used(), sys.total);
+        let mut detail = format!(
+            "\nWindows {} · WSL disks {}",
+            gib(d.windows_used(&sys)),
+            gib(d.vhd_total())
+        );
+        if let Some(r) = d.reclaimable().filter(|&r| r >= 1 << 30) {
+            detail.push_str(&format!(" · ↓{}", gib(r)));
+        }
+        row(vec![], vec![]);
+        row(
+            vec![
+                l(format!("{}:  ", sys.letter)),
+                seg(of(sys.used(), sys.total), theme::level(p, fr), true),
+                l(detail),
+            ],
+            vec![l("changes slowly:\nno graph".into())],
+        );
+    }
+    vec![text, graph]
+}
+
+/// Insights: a one-line summary, then only what needs attention and why.
+fn insights_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -> Vec<Column> {
+    let frac = |a: u64, b: u64| a as f64 / b.max(1) as f64;
+    let l = |t: String| seg(t, p.label, false);
+    let v = |t: String| seg(t, p.value, true);
+    // (color, title, detail)
+    let mut items: Vec<(D2D1_COLOR_F, String, String)> = Vec::new();
+    let severity = |fr: f64| if fr >= 0.9 { p.crit } else { p.warn };
+
+    if let (true, Some((u, lim))) = (c.panel.commit, s.commit) {
+        let fr = frac(u, lim);
+        if fr >= 0.85 {
+            let who = s.vm.map_or(String::new(), |vm| {
+                format!("The WSL VM holds {} of it. ", g1(vm.private))
+            });
+            items.push((
+                severity(fr),
+                format!("Commit at {}", pct(fr * 100.0)),
+                format!("{who}Allocations start failing near 100%."),
+            ));
+        }
+    }
+    let ram = frac(s.used, s.total);
+    if ram >= 0.85 {
+        let detail = match s.vm {
+            Some(_) => format!(
+                "WSL uses {}. Reclaim WSL cache, or set a memory limit.",
+                g1(s.vm_ram())
+            ),
+            None => format!("Windows uses {}.", g1(s.windows())),
+        };
+        items.push((
+            severity(ram),
+            format!("RAM at {}", pct(ram * 100.0)),
+            detail,
+        ));
+    }
+    if let (true, Some(d)) = (c.panel.disk, d) {
+        for vhd in &d.vhds {
+            match vhd.reclaimable() {
+                Some(r) if !vhd.sparse && r >= 5 << 30 => items.push((
+                    p.warn,
+                    format!("{} stuck in {}'s disk", gib(r), vhd.name),
+                    "Linux freed it, but the .vhdx still holds it (not sparse).".into(),
+                )),
+                _ => {}
+            }
+        }
+        for drive in &d.drives {
+            let fr = frac(drive.used(), drive.total);
+            if fr >= 0.85 {
+                items.push((
+                    severity(fr),
+                    format!("{}: is {} full", drive.letter, pct(fr * 100.0)),
+                    format!(
+                        "{} free · WSL disks {}",
+                        gib(drive.free),
+                        gib(d
+                            .vhds
+                            .iter()
+                            .filter(|x| x.drive() == Some(drive.letter))
+                            .map(|x| x.on_disk)
+                            .sum())
+                    ),
+                ));
+            }
+        }
+    }
+    if s.vm.is_some() {
+        let wc = s.wslconfig;
+        if wc.memory.is_none() {
+            items.push((
+                p.win,
+                "No WSL memory limit".into(),
+                format!("The VM may grow to {} (half your RAM).", g1(s.total / 2)),
+            ));
+        }
+        if wc.reclaim == Reclaim::NotSet {
+            items.push((
+                p.win,
+                "Memory reclaim not set".into(),
+                "Linux keeps its cache; \"gradual\" hands it back over time.".into(),
+            ));
+        }
+    }
+
+    let mut col: Column = Vec::new();
+    let mut summary = vec![
+        seg(
+            format!("{} / {}", g1(s.used), g1(s.total)),
+            theme::level(p, ram),
+            true,
+        ),
+        l(" RAM · WIN ".into()),
+        v(g1(s.windows())),
+        l(" · WSL ".into()),
+        v(match s.vm {
+            Some(_) => g1(s.vm_ram()),
+            None => "off".into(),
+        }),
+    ];
+    if c.panel.cpu {
+        summary.push(l(" · CPU ".into()));
+        summary.push(v(s.cpu.map_or("–".into(), pct)));
+    }
+    if c.panel.gpu {
+        summary.push(l(" · GPU ".into()));
+        summary.push(v(s.gpu.map_or("–".into(), |x| pct(x.percent))));
+    }
+    col.push(summary);
+    col.push(vec![]);
+    if items.is_empty() {
+        col.push(vec![
+            seg("✓  ", p.win, true),
+            v("Nothing needs attention".into()),
+        ]);
+    } else {
+        col.push(vec![seg("NEEDS ATTENTION", p.label, true)]);
+        for (color, title, detail) in items {
+            col.push(vec![]);
+            col.push(vec![seg("●  ", color, true), v(title)]);
+            col.push(vec![l(format!("    {detail}"))]);
+        }
+    }
+    col.push(vec![]);
+    col.push(vec![l(
+        "Right-click for actions: reclaim cache, memory limit, shut down WSL".into(),
+    )]);
+    vec![col]
+}
+
+/// The tray icon's second bar, as picked in Display > Tray icon.
 fn second_bar(s: &Snapshot) -> Option<f32> {
     let c = app().config.get();
     let frac = |a: u64, b: u64| a as f32 / b.max(1) as f32;
-    if c.commit {
-        if let Some((u, l)) = s.commit {
-            return Some(frac(u, l));
+    match c.tray_second {
+        TraySecond::Commit => s.commit.map(|(u, l)| frac(u, l)),
+        TraySecond::Disk => {
+            let sys = disk_snap()?.system()?;
+            Some(frac(sys.used(), sys.total))
         }
+        TraySecond::Cpu => s.cpu.map(|v| v as f32 / 100.0),
+        TraySecond::Nothing => None,
     }
-    if c.disk {
-        let d = disk_snap()?;
-        let sys = d.system()?;
-        return Some(frac(sys.used(), sys.total));
-    }
-    None
 }
 
 fn update_tray(s: &Snapshot) {
@@ -1259,28 +1868,72 @@ fn display_menu() -> Option<HMENU> {
     for (i, s) in Show::ALL.iter().enumerate() {
         menu_item(m, true, c.show == *s, ID_SHOW + i, s.label());
     }
-    menu_item(
-        m,
-        c.show.tray(),
-        tray::promoted() == Some(true),
-        ID_TRAY_PROMOTE,
-        "Keep tray icon visible (not under ^)",
-    );
     separator(m);
+
+    let strip = unsafe { CreatePopupMenu().ok()? };
+    menu_item(strip, false, false, 0, "Layout");
     for (i, l) in Layout::ALL.iter().enumerate() {
-        menu_item(m, true, c.layout == *l, ID_LAYOUT + i, l.label());
+        menu_item(
+            strip,
+            true,
+            c.layout == *l,
+            ID_LAYOUT + i,
+            &format!("    {}", l.label()),
+        );
     }
-    separator(m);
+    separator(strip);
+    menu_item(strip, false, false, 0, "Show");
     for (i, t) in Toggle::ALL.iter().enumerate() {
         // Compact shows memory only.
+        let on = c.layout != Layout::Compact;
         menu_item(
-            m,
-            c.layout != Layout::Compact,
-            c.shows(*t),
+            strip,
+            on,
+            c.strip.shows(*t),
             ID_TOGGLE + i,
+            &format!("    {}", t.label()),
+        );
+    }
+    submenu(m, strip, "Taskbar strip");
+
+    let panel = unsafe { CreatePopupMenu().ok()? };
+    menu_item(panel, false, false, 0, "Style");
+    for (i, st) in PanelStyle::ALL.iter().enumerate() {
+        menu_item(
+            panel,
+            true,
+            c.style == *st,
+            ID_PANEL_STYLE + i,
+            &format!("    {}", st.label()),
+        );
+    }
+    separator(panel);
+    menu_item(panel, false, false, 0, "Show");
+    for (i, t) in Toggle::ALL.iter().enumerate() {
+        let text = format!("    {}", t.label());
+        menu_item(panel, true, c.panel.shows(*t), ID_PANEL_TOGGLE + i, &text);
+    }
+    submenu(m, panel, "Hover panel");
+
+    let icon = unsafe { CreatePopupMenu().ok()? };
+    for (i, t) in TraySecond::ALL.iter().enumerate() {
+        menu_item(
+            icon,
+            true,
+            c.tray_second == *t,
+            ID_TRAY_SECOND + i,
             t.label(),
         );
     }
+    separator(icon);
+    menu_item(
+        icon,
+        c.show.tray(),
+        tray::promoted() == Some(true),
+        ID_TRAY_PROMOTE,
+        "Keep visible (not under ^)",
+    );
+    submenu(m, icon, "Tray icon");
     Some(m)
 }
 

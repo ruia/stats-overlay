@@ -60,17 +60,125 @@ impl Show {
     }
 }
 
+/// Hover panel designs, picked from Display > Panel.
 #[derive(Clone, Copy, PartialEq)]
-pub struct Config {
-    pub show: Show,
-    pub layout: Layout,
+pub enum PanelStyle {
+    /// Label/value rows grouped into Memory, WSL, Disk, CPU · GPU.
+    Sections,
+    /// One Windows/WSL bar per resource.
+    Bars,
+    /// Six tiles: big number and bar each.
+    Tiles,
+    /// Values next to 60-second history graphs.
+    History,
+    /// A summary line, then what needs attention.
+    Insights,
+}
+
+impl PanelStyle {
+    pub const ALL: [PanelStyle; 5] = [
+        PanelStyle::Sections,
+        PanelStyle::Bars,
+        PanelStyle::Tiles,
+        PanelStyle::History,
+        PanelStyle::Insights,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PanelStyle::Sections => "Sections (detailed)",
+            PanelStyle::Bars => "Bars",
+            PanelStyle::Tiles => "Tiles",
+            PanelStyle::History => "History (last minute)",
+            PanelStyle::Insights => "Insights (what needs attention)",
+        }
+    }
+}
+
+/// What the tray icon's second bar shows (the first is always RAM).
+#[derive(Clone, Copy, PartialEq)]
+pub enum TraySecond {
+    Commit,
+    Disk,
+    Cpu,
+    Nothing,
+}
+
+impl TraySecond {
+    pub const ALL: [TraySecond; 4] = [
+        TraySecond::Commit,
+        TraySecond::Disk,
+        TraySecond::Cpu,
+        TraySecond::Nothing,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TraySecond::Commit => "Second bar: commit charge",
+            TraySecond::Disk => "Second bar: system drive",
+            TraySecond::Cpu => "Second bar: CPU",
+            TraySecond::Nothing => "RAM bar only",
+        }
+    }
+}
+
+/// The optional items, chosen separately for the strip and for the panel.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Items {
     pub cpu: bool,
     pub gpu: bool,
     pub commit: bool,
     pub disk: bool,
 }
 
-/// The columns that can be toggled, in menu order.
+impl Items {
+    fn from_bits(b: u32) -> Items {
+        Items {
+            cpu: b & 1 != 0,
+            gpu: b & 2 != 0,
+            commit: b & 4 != 0,
+            disk: b & 8 != 0,
+        }
+    }
+
+    fn bits(self) -> u32 {
+        self.cpu as u32
+            | (self.gpu as u32) << 1
+            | (self.commit as u32) << 2
+            | (self.disk as u32) << 3
+    }
+
+    pub fn shows(&self, t: Toggle) -> bool {
+        match t {
+            Toggle::Cpu => self.cpu,
+            Toggle::Gpu => self.gpu,
+            Toggle::Commit => self.commit,
+            Toggle::Disk => self.disk,
+        }
+    }
+
+    fn flip(&mut self, t: Toggle) {
+        let on = !self.shows(t);
+        match t {
+            Toggle::Cpu => self.cpu = on,
+            Toggle::Gpu => self.gpu = on,
+            Toggle::Commit => self.commit = on,
+            Toggle::Disk => self.disk = on,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Config {
+    pub show: Show,
+    pub layout: Layout,
+    pub strip: Items,
+    pub style: PanelStyle,
+    pub panel: Items,
+    pub tray_second: TraySecond,
+}
+
+/// The items that can be toggled, in menu order.
 #[derive(Clone, Copy)]
 pub enum Toggle {
     Cpu,
@@ -90,70 +198,54 @@ impl Toggle {
             Toggle::Disk => "Disk",
         }
     }
+}
 
-    fn name(self) -> &'static str {
-        match self {
-            Toggle::Cpu => "ShowCpu",
-            Toggle::Gpu => "ShowGpu",
-            Toggle::Commit => "ShowCommit",
-            Toggle::Disk => "ShowDisk",
-        }
-    }
+fn index<T: PartialEq>(all: &[T], v: &T) -> u32 {
+    all.iter().position(|x| x == v).unwrap_or(0) as u32
 }
 
 impl Config {
     pub fn load() -> Config {
         let get = |name: &str| reg_dword(HKEY_CURRENT_USER, KEY, name);
-        let on = |t: Toggle| get(t.name()) != Some(0);
+        let pick = |name: &str, n: usize| get(name).map_or(0, |v| v as usize).min(n - 1);
         Config {
-            show: match get("Show") {
-                Some(1) => Show::Tray,
-                Some(2) => Show::Both,
-                _ => Show::Taskbar,
-            },
-            layout: match get("Layout") {
-                Some(1) => Layout::ByOwner,
-                Some(2) => Layout::Bars,
-                Some(3) => Layout::Compact,
-                _ => Layout::Grid,
-            },
-            cpu: on(Toggle::Cpu),
-            gpu: on(Toggle::Gpu),
-            commit: on(Toggle::Commit),
-            disk: on(Toggle::Disk),
-        }
-    }
-
-    pub fn shows(&self, t: Toggle) -> bool {
-        match t {
-            Toggle::Cpu => self.cpu,
-            Toggle::Gpu => self.gpu,
-            Toggle::Commit => self.commit,
-            Toggle::Disk => self.disk,
+            show: Show::ALL[pick("Show", Show::ALL.len())],
+            layout: Layout::ALL[pick("Layout", Layout::ALL.len())],
+            strip: Items::from_bits(get("StripItems").unwrap_or(0xf)),
+            style: PanelStyle::ALL[pick("PanelStyle", PanelStyle::ALL.len())],
+            panel: Items::from_bits(get("PanelItems").unwrap_or(0xf)),
+            tray_second: TraySecond::ALL[pick("TraySecond", TraySecond::ALL.len())],
         }
     }
 
     pub fn set_layout(&mut self, layout: Layout) {
         self.layout = layout;
-        let i = Layout::ALL.iter().position(|&l| l == layout).unwrap_or(0);
-        save("Layout", i as u32);
+        save("Layout", index(&Layout::ALL, &layout));
     }
 
     pub fn set_show(&mut self, show: Show) {
         self.show = show;
-        let i = Show::ALL.iter().position(|&s| s == show).unwrap_or(0);
-        save("Show", i as u32);
+        save("Show", index(&Show::ALL, &show));
     }
 
-    pub fn flip(&mut self, t: Toggle) {
-        let on = !self.shows(t);
-        match t {
-            Toggle::Cpu => self.cpu = on,
-            Toggle::Gpu => self.gpu = on,
-            Toggle::Commit => self.commit = on,
-            Toggle::Disk => self.disk = on,
-        }
-        save(t.name(), on as u32);
+    pub fn set_style(&mut self, style: PanelStyle) {
+        self.style = style;
+        save("PanelStyle", index(&PanelStyle::ALL, &style));
+    }
+
+    pub fn set_tray_second(&mut self, t: TraySecond) {
+        self.tray_second = t;
+        save("TraySecond", index(&TraySecond::ALL, &t));
+    }
+
+    pub fn flip_strip(&mut self, t: Toggle) {
+        self.strip.flip(t);
+        save("StripItems", self.strip.bits());
+    }
+
+    pub fn flip_panel(&mut self, t: Toggle) {
+        self.panel.flip(t);
+        save("PanelItems", self.panel.bits());
     }
 }
 
