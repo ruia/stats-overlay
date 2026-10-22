@@ -86,13 +86,13 @@ impl Snapshot {
 
 pub static LATEST: Mutex<Option<Snapshot>> = Mutex::new(None);
 
-pub fn spawn(notify: HWND) {
+pub fn spawn(notify: HWND, cpu: bool, gpu: bool) {
     let notify = notify.0 as usize;
     let _ = std::thread::Builder::new()
         .stack_size(256 * 1024)
         .spawn(move || {
             let _ = SAMPLER.set(std::thread::current());
-            let pdh = metrics::Pdh::open();
+            let pdh = metrics::Pdh::open(cpu, gpu);
             let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
             let mut wsl_checked: Option<Instant> = None;
             let mut reclaim_checked: Option<Instant> = None;

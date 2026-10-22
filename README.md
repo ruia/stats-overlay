@@ -48,6 +48,7 @@ Output: `target\release\statsoverlay.exe`.
 | `statsoverlay.exe` | Embeds the strip in the taskbar (falls back to a topmost overlay if that fails). |
 | `statsoverlay.exe --popup` | Forces the fallback overlay mode. |
 | `statsoverlay.exe --offset 120` | Left offset in logical px, instead of the Widgets-button guess. |
+| `statsoverlay.exe --no-cpu` / `--no-gpu` | Turns the PDH CPU or GPU counters off (to measure their memory cost). |
 | `statsoverlay.exe --diag` | Writes `statsoverlay-diag.txt` next to the exe and opens it. |
 
 Left-click opens Task Manager. Right-click: Reclaim WSL cache (drops Linux's page

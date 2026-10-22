@@ -33,7 +33,11 @@ pub struct Gpu {
 }
 
 impl Pdh {
-    pub fn open() -> Option<Pdh> {
+    /// `--no-cpu` / `--no-gpu` turn counters off, to measure what each one costs.
+    pub fn open(cpu: bool, gpu: bool) -> Option<Pdh> {
+        if !cpu && !gpu {
+            return None;
+        }
         unsafe {
             let mut query = PDH_HQUERY::default();
             if PdhOpenQueryW(None, 0, &mut query) != 0 {
@@ -45,9 +49,15 @@ impl Pdh {
             };
             let p = Pdh {
                 query,
-                cpu: add(w!("\\Processor Information(_Total)\\% Processor Utility")),
-                gpu: add(w!("\\GPU Engine(*engtype_3D)\\Utilization Percentage")),
-                vram: add(w!("\\GPU Adapter Memory(*)\\Dedicated Usage")),
+                cpu: cpu
+                    .then(|| add(w!("\\Processor Information(_Total)\\% Processor Utility")))
+                    .flatten(),
+                gpu: gpu
+                    .then(|| add(w!("\\GPU Engine(*engtype_3D)\\Utilization Percentage")))
+                    .flatten(),
+                vram: gpu
+                    .then(|| add(w!("\\GPU Adapter Memory(*)\\Dedicated Usage")))
+                    .flatten(),
             };
             // Rate counters need a first sample to diff against.
             PdhCollectQueryData(query);

@@ -61,6 +61,8 @@ static ACTION_BUSY: AtomicBool = AtomicBool::new(false);
 struct Opts {
     popup: bool,
     offset: Option<i32>,
+    no_cpu: bool,
+    no_gpu: bool,
 }
 
 struct App {
@@ -99,6 +101,8 @@ fn main() {
     let opts = Opts {
         popup: args.iter().any(|a| a == "--popup"),
         offset,
+        no_cpu: args.iter().any(|a| a == "--no-cpu"),
+        no_gpu: args.iter().any(|a| a == "--no-gpu"),
     };
 
     unsafe {
@@ -171,7 +175,7 @@ fn main() {
             return;
         };
         app.host.set(host);
-        sampler::spawn(host);
+        sampler::spawn(host, !app.opts.no_cpu, !app.opts.no_gpu);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
