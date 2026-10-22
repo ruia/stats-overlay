@@ -13,6 +13,7 @@
 #![windows_subsystem = "windows"]
 
 mod diag;
+mod procs;
 mod render;
 mod sampler;
 mod taskbar;
@@ -326,14 +327,14 @@ fn refresh() {
 
 fn build_lines(s: &Snapshot, p: &theme::Palette) -> Vec<Vec<Seg>> {
     let seg = |text: String, color, bold| Seg { text, color, bold };
-    let win = s.used.saturating_sub(s.wsl.unwrap_or(0));
+    let win = s.windows();
     let frac = if s.total > 0 {
         s.used as f64 / s.total as f64
     } else {
         0.0
     };
-    let wsl = match s.wsl {
-        Some(b) => seg(gib(b), p.value, true),
+    let wsl = match s.vm {
+        Some(_) => seg(gib(s.vm_ram()), p.value, true),
         None => seg("off".into(), p.label, false),
     };
     vec![
@@ -376,17 +377,19 @@ fn show_menu() {
         "Mode: overlay (fallback)"
     };
     let mode_w = wide(mode);
-    let wsl_w = wide(
-        &sampler::LATEST
-            .lock()
-            .unwrap()
-            .map(|s| wsl_summary(&s))
-            .unwrap_or_default(),
-    );
+    let snap = *sampler::LATEST.lock().unwrap();
+    let info: Vec<Vec<u16>> = snap
+        .map(|s| wsl_summary(&s))
+        .unwrap_or_default()
+        .iter()
+        .map(|l| wide(l))
+        .collect();
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&mode_w));
-        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&wsl_w));
+        for line in &info {
+            let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(line));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_TASKMGR, w!("Open Task Manager"));
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
@@ -408,19 +411,24 @@ fn show_menu() {
     }
 }
 
-/// One line for the menu until v1's hover panel exists.
-fn wsl_summary(s: &Snapshot) -> String {
-    match (s.wsl_state, s.linux, s.wsl) {
-        (WslState::Off, ..) => "WSL: off".into(),
-        (WslState::NoDistro, ..) => "WSL: VM up, no distro running (not polled)".into(),
-        (WslState::Running, Some(l), Some(vm)) => format!(
-            // Linux's own cache figure: the VM's working set can be smaller than
-            // Linux "used" when Windows has paged or compressed part of the VM.
-            "Linux: used {} (cache {}), VM working set {}",
-            gib(l.used()),
-            gib(l.cache),
-            gib(vm)
-        ),
-        (WslState::Running, ..) => "WSL: distro running, meminfo unavailable".into(),
+/// Menu lines until v1's hover panel exists.
+fn wsl_summary(s: &Snapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(vm) = s.vm {
+        lines.push(format!(
+            "WSL VM: {} in RAM + {} compressed, {} committed",
+            gib(vm.working_set),
+            gib(s.vm_compressed()),
+            gib(vm.private)
+        ));
     }
+    lines.push(match (s.wsl_state, s.linux) {
+        (WslState::Off, _) => "WSL: off".into(),
+        (WslState::NoDistro, _) => "WSL: VM up, no distro running (not polled)".into(),
+        (WslState::Running, Some(l)) => {
+            format!("Linux: used {} (cache {})", gib(l.used()), gib(l.cache))
+        }
+        (WslState::Running, None) => "WSL: distro running, meminfo unavailable".into(),
+    });
+    lines
 }

@@ -2,7 +2,7 @@
 //! what v0 needs verified: Windows build, taskbar geometry and children, the
 //! Widgets/Start button bounds (via UI Automation), and the vmmem PDH instances.
 
-use crate::sampler::{memory_status, vmmem_working_set, Pdh};
+use crate::sampler::memory_status;
 use crate::taskbar;
 use crate::util::{reg_dword, reg_string, wide, GIB};
 use std::fmt::Write;
@@ -93,54 +93,66 @@ pub fn run() {
         avail as f64 / GIB,
         (total - avail) as f64 / GIB
     );
-    for (label, path) in [
-        ("Working Set", w!("\\Process(*)\\Working Set")),
-        (
-            "Working Set - Private",
-            w!("\\Process(*)\\Working Set - Private"),
-        ),
-        ("Private Bytes", w!("\\Process(*)\\Private Bytes")),
-        ("ID Process", w!("\\Process(*)\\ID Process")),
+    let g = |b: u64| b as f64 / GIB;
+    let special = crate::procs::special().unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "\nNtQuerySystemInformation (GiB, working set / committed private):"
+    );
+    for (name, m) in [
+        ("vmmemWSL", special.wsl),
+        ("vmmem", special.vmmem),
+        ("Memory Compression", special.compression),
     ] {
-        let _ = writeln!(
-            out,
-            "\nPDH \\Process(*)\\{label}, instances containing 'vmmem':"
-        );
-        match Pdh::open_path(path).and_then(|p| p.collect()) {
-            None => {
-                let _ = writeln!(out, "  query failed");
+        match m {
+            Some(m) => {
+                let _ = writeln!(
+                    out,
+                    "  {name}: {:.2} / {:.2}",
+                    g(m.working_set),
+                    g(m.private)
+                );
             }
-            Some(items) => {
-                let hits: Vec<_> = items
-                    .iter()
-                    .filter(|(n, _)| n.to_ascii_lowercase().contains("vmmem"))
-                    .collect();
-                if hits.is_empty() {
-                    let _ = writeln!(out, "  none (WSL VM not running?)");
-                }
-                for (n, v) in &hits {
-                    if label == "ID Process" {
-                        let _ = writeln!(out, "  {n}: {v}");
-                    } else {
-                        let _ = writeln!(out, "  {n}: {:.3} GiB ({} bytes)", *v as f64 / GIB, v);
-                    }
-                }
-                if label == "Working Set" {
-                    let _ = writeln!(
-                        out,
-                        "  -> value StatsOverlay shows as WSL: {:?}",
-                        vmmem_working_set(&items).map(|b| format!("{:.2} GiB", b as f64 / GIB))
-                    );
-                }
+            None => {
+                let _ = writeln!(out, "  {name}: not running");
             }
         }
     }
+    let snap = crate::sampler::Snapshot {
+        total,
+        used: total - avail,
+        vm: special.wsl_vm(),
+        compressed: special.compression.map_or(0, |c| c.working_set),
+        wsl_state: crate::sampler::WslState::Off,
+        linux: None,
+    };
+    let _ = writeln!(
+        out,
+        "  -> strip shows: WIN {:.2}, WSL {:.2} (VM in RAM {:.2} + compressed share {:.2})",
+        g(snap.windows()),
+        g(snap.vm_ram()),
+        g(snap.vm.map_or(0, |v| v.working_set)),
+        g(snap.vm_compressed())
+    );
+
+    let mut all: Vec<(String, crate::procs::ProcMem)> = Vec::new();
+    crate::procs::for_each(|n, m| all.push((String::from_utf16_lossy(n), m)));
+    all.sort_by_key(|(_, m)| std::cmp::Reverse(m.working_set));
+    let _ = writeln!(
+        out,
+        "\nTop 15 processes by working set (GiB, working set / committed private):"
+    );
+    for (n, m) in all.iter().take(15) {
+        let _ = writeln!(
+            out,
+            "  {n:<32} {:.2} / {:.2}",
+            g(m.working_set),
+            g(m.private)
+        );
+    }
 
     let _ = writeln!(out, "\n== WSL distros ==");
-    let vm_up = Pdh::open()
-        .and_then(|p| p.collect())
-        .and_then(|i| vmmem_working_set(&i))
-        .is_some();
+    let vm_up = special.wsl_vm().is_some();
     if !vm_up {
         let _ = writeln!(
             out,

@@ -36,6 +36,9 @@ Items marked **(done)** are already handled in the v0 code.
    of that is shared DLL pages. The meaningful budget number is
    "Memory (private working set)" in Task Manager. v0 uses a software render
    target (no Direct3D device), which saves several MB. Please report both numbers.
+   First measurement: 8.9 MB. PDH was then replaced with a single
+   NtQuerySystemInformation call (the source Task Manager uses), so pdh.dll and
+   the performance-counter stack are no longer loaded.
 6. **`vmmem` isn't always WSL.** On current systems a process named `vmmem` can be
    Windows Sandbox or another Hyper-V VM. v0 reads `vmmemWSL*` and falls back to
    plain `vmmem` only when no `vmmemWSL` exists.
