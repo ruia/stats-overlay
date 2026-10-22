@@ -99,6 +99,7 @@ pub fn run() {
             "Working Set - Private",
             w!("\\Process(*)\\Working Set - Private"),
         ),
+        ("Private Bytes", w!("\\Process(*)\\Private Bytes")),
         ("ID Process", w!("\\Process(*)\\ID Process")),
     ] {
         let _ = writeln!(
@@ -148,19 +149,23 @@ pub fn run() {
     } else {
         let distros = crate::wsl::running_distros();
         let _ = writeln!(out, "wsl --list --running --quiet: {distros:?}");
-        match crate::wsl::pick(&distros) {
-            None => {
-                let _ = writeln!(out, "no distro running: meminfo not read");
-            }
-            Some(d) => match crate::wsl::meminfo(d) {
+        let _ = writeln!(out, "read order: {:?}", crate::wsl::read_order(&distros));
+        for d in crate::wsl::read_order(&distros) {
+            match crate::wsl::meminfo(d) {
                 None => {
                     let _ = writeln!(out, "meminfo via {d}: failed");
                 }
                 Some(m) => {
-                    let _ = writeln!(out, "meminfo via {d}: total {:.2} GiB, available {:.2} GiB, used {:.2} GiB, buffers+cached {:.2} GiB",
-                        m.total as f64 / GIB, m.available as f64 / GIB, m.used() as f64 / GIB, m.cache as f64 / GIB);
+                    let _ = writeln!(
+                        out,
+                        "meminfo via {d}: total {:.2} GiB, available {:.2} GiB, used {:.2} GiB, buffers+cached {:.2} GiB",
+                        m.total as f64 / GIB,
+                        m.available as f64 / GIB,
+                        m.used() as f64 / GIB,
+                        m.cache as f64 / GIB
+                    );
                 }
-            },
+            }
         }
     }
 

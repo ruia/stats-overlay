@@ -414,11 +414,12 @@ fn wsl_summary(s: &Snapshot) -> String {
         (WslState::Off, ..) => "WSL: off".into(),
         (WslState::NoDistro, ..) => "WSL: VM up, no distro running (not polled)".into(),
         (WslState::Running, Some(l), Some(vm)) => format!(
-            "Linux: used {}, cache {}, VM holds {} (other {})",
+            // Linux's own cache figure: the VM's working set can be smaller than
+            // Linux "used" when Windows has paged or compressed part of the VM.
+            "Linux: used {} (cache {}), VM working set {}",
             gib(l.used()),
             gib(l.cache),
-            gib(vm),
-            gib(vm.saturating_sub(l.used()))
+            gib(vm)
         ),
         (WslState::Running, ..) => "WSL: distro running, meminfo unavailable".into(),
     }
