@@ -1,8 +1,9 @@
 //! Sampler thread: collects a RAM snapshot every 2 s and pokes the UI thread.
 //! The UI never calls into PDH; it only redraws from the latest snapshot.
 
+use crate::wsl::{self, LinuxMem};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Performance::{
@@ -14,6 +15,19 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub const WM_APP_SAMPLE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 const INTERVAL: Duration = Duration::from_secs(2);
+/// Longer than the time a distro waits idle before stopping, so polling never keeps
+/// a distro (and with it the VM) alive after you close your terminals.
+const WSL_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum WslState {
+    /// No VmmemWSL: the VM is stopped. wsl.exe is never called in this state.
+    Off,
+    /// VM up, but no distro running yet (or not checked yet). It shuts down on its own.
+    NoDistro,
+    /// At least one distro running; `linux` holds its last meminfo read.
+    Running,
+}
 
 #[derive(Clone, Copy)]
 pub struct Snapshot {
@@ -23,6 +37,9 @@ pub struct Snapshot {
     pub used: u64,
     /// Working set of VmmemWSL, None when the WSL VM is not running.
     pub wsl: Option<u64>,
+    pub wsl_state: WslState,
+    /// Linux's own view, refreshed every WSL_INTERVAL while a distro runs.
+    pub linux: Option<LinuxMem>,
 }
 
 pub static LATEST: Mutex<Option<Snapshot>> = Mutex::new(None);
@@ -31,8 +48,24 @@ pub fn spawn(notify: HWND) {
     let notify = notify.0 as usize;
     std::thread::spawn(move || {
         let pdh = Pdh::open();
+        let mut wsl_checked: Option<Instant> = None;
+        let (mut wsl_state, mut linux) = (WslState::Off, None);
         loop {
-            let snap = sample(pdh.as_ref());
+            let mut snap = sample(pdh.as_ref());
+            if snap.wsl.is_none() {
+                // VM stopped: never call wsl.exe, it would boot the VM.
+                (wsl_state, linux, wsl_checked) = (WslState::Off, None, None);
+            } else if wsl_checked.is_none_or(|t| t.elapsed() >= WSL_INTERVAL) {
+                wsl_checked = Some(Instant::now());
+                let distros = wsl::running_distros();
+                match wsl::pick(&distros) {
+                    Some(d) => (wsl_state, linux) = (WslState::Running, wsl::meminfo(d).or(linux)),
+                    None => (wsl_state, linux) = (WslState::NoDistro, None),
+                }
+            } else if wsl_state == WslState::Off {
+                wsl_state = WslState::NoDistro;
+            }
+            (snap.wsl_state, snap.linux) = (wsl_state, linux);
             *LATEST.lock().unwrap() = Some(snap);
             unsafe {
                 let _ = PostMessageW(Some(HWND(notify as _)), WM_APP_SAMPLE, WPARAM(0), LPARAM(0));
@@ -51,6 +84,8 @@ fn sample(pdh: Option<&Pdh>) -> Snapshot {
         total,
         used: total.saturating_sub(avail),
         wsl,
+        wsl_state: WslState::Off,
+        linux: None,
     }
 }
 

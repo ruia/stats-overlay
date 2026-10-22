@@ -135,6 +135,35 @@ pub fn run() {
         }
     }
 
+    let _ = writeln!(out, "\n== WSL distros ==");
+    let vm_up = Pdh::open()
+        .and_then(|p| p.collect())
+        .and_then(|i| vmmem_working_set(&i))
+        .is_some();
+    if !vm_up {
+        let _ = writeln!(
+            out,
+            "VmmemWSL not running: wsl.exe not called (it would boot the VM)"
+        );
+    } else {
+        let distros = crate::wsl::running_distros();
+        let _ = writeln!(out, "wsl --list --running --quiet: {distros:?}");
+        match crate::wsl::pick(&distros) {
+            None => {
+                let _ = writeln!(out, "no distro running: meminfo not read");
+            }
+            Some(d) => match crate::wsl::meminfo(d) {
+                None => {
+                    let _ = writeln!(out, "meminfo via {d}: failed");
+                }
+                Some(m) => {
+                    let _ = writeln!(out, "meminfo via {d}: total {:.2} GiB, available {:.2} GiB, used {:.2} GiB, buffers+cached {:.2} GiB",
+                        m.total as f64 / GIB, m.available as f64 / GIB, m.used() as f64 / GIB, m.cache as f64 / GIB);
+                }
+            },
+        }
+    }
+
     let path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("statsoverlay-diag.txt")))

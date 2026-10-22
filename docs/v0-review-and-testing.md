@@ -19,7 +19,7 @@ Items marked **(done)** are already handled in the v0 code.
    details: fully transparent pixels are click-through, so the background is drawn
    at alpha 1/255 to keep clicks between words working; and ClearType can't be used
    over a transparent background, so text uses grayscale antialiasing.
-4. **Polling `wsl.exe` every 5 s would keep WSL running forever (v1).** Each call
+4. **Polling `wsl.exe` every 5 s would keep WSL running forever (done).** Each call
    starts a process inside a distro, which resets the distro's idle timer, so the
    VM never reaches its own idle shutdown. Each spawn also costs some CPU, which
    works against ~0% idle. Suggestion: call `wsl.exe` only when a distro is
@@ -27,7 +27,10 @@ Items marked **(done)** are already handled in the v0 code.
    poll less often than the idle timeout (30 s or more) or only while the hover
    panel is open. The same applies to the 60 s `df` poll. I'm confident about the
    mechanism but quoting the timeout values from memory; v1 testing will show
-   whether VmmemWSL still disappears when WSL is idle.
+   whether VmmemWSL still disappears when WSL is idle. Now implemented in
+   `src/wsl.rs` and the sampler: no VmmemWSL means wsl.exe is never called; with
+   the VM up, `wsl --list --running --quiet` runs at most every 30 s, and meminfo
+   is read only through a distro that is already running.
 5. **The 5 MB working-set target is tight with Direct2D/DirectWrite.** Loading
    those DLLs alone probably puts the full working set at 6 to 10 MB, though most
    of that is shared DLL pages. The meaningful budget number is
@@ -121,3 +124,21 @@ set)". Also check that the taskbar itself stays responsive.
 
 Exit the strip, run `statsoverlay.exe --popup`. **Screenshot H.** It should sit in
 the same place, above the taskbar, and hide while a fullscreen app or game runs.
+
+### 7. WSL polling never keeps WSL alive
+
+The strip doesn't show Linux's numbers yet (that's v1's hover panel), but the
+right-click menu has a second line with what the sampler sees:
+`WSL: off`, `WSL: VM up, no distro running (not polled)`, or
+`Linux: used X, cache Y, VM holds Z (other W)`.
+
+- With a WSL terminal open, wait up to 30 s, then **screenshot the menu (I)**.
+  Compare "used" with `free -h` in that terminal.
+- Close every WSL terminal and leave the strip running. Within a couple of
+  minutes the menu should go to "no distro running", then `WSL: off`, and
+  VmmemWSL should disappear from Task Manager. **Tell me how long that took**, and
+  whether it ever doesn't happen. That is the proof the polling doesn't keep WSL
+  alive.
+- With WSL off, nothing should start it: VmmemWSL must not reappear on its own.
+- `--diag` now also lists running distros and the meminfo read (only when the VM
+  is already up).

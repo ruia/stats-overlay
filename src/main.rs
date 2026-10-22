@@ -18,9 +18,10 @@ mod sampler;
 mod taskbar;
 mod theme;
 mod util;
+mod wsl;
 
 use render::{Renderer, Seg};
-use sampler::{Snapshot, WM_APP_SAMPLE};
+use sampler::{Snapshot, WslState, WM_APP_SAMPLE};
 use std::cell::{Cell, OnceCell, RefCell};
 use util::{gib, pcwstr, wide};
 use windows::core::{w, PCWSTR};
@@ -375,9 +376,17 @@ fn show_menu() {
         "Mode: overlay (fallback)"
     };
     let mode_w = wide(mode);
+    let wsl_w = wide(
+        &sampler::LATEST
+            .lock()
+            .unwrap()
+            .map(|s| wsl_summary(&s))
+            .unwrap_or_default(),
+    );
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&mode_w));
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&wsl_w));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_TASKMGR, w!("Open Task Manager"));
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
@@ -396,5 +405,21 @@ fn show_menu() {
         );
         let _ = PostMessageW(Some(host), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
+    }
+}
+
+/// One line for the menu until v1's hover panel exists.
+fn wsl_summary(s: &Snapshot) -> String {
+    match (s.wsl_state, s.linux, s.wsl) {
+        (WslState::Off, ..) => "WSL: off".into(),
+        (WslState::NoDistro, ..) => "WSL: VM up, no distro running (not polled)".into(),
+        (WslState::Running, Some(l), Some(vm)) => format!(
+            "Linux: used {}, cache {}, VM holds {} (other {})",
+            gib(l.used()),
+            gib(l.cache),
+            gib(vm),
+            gib(vm.saturating_sub(l.used()))
+        ),
+        (WslState::Running, ..) => "WSL: distro running, meminfo unavailable".into(),
     }
 }

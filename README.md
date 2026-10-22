@@ -30,7 +30,7 @@ Output: `target\release\statsoverlay.exe`.
 | `statsoverlay.exe --offset 120` | Left offset in logical px, instead of the Widgets-button guess. |
 | `statsoverlay.exe --diag` | Writes `statsoverlay-diag.txt` next to the exe and opens it. |
 
-Left-click opens Task Manager. Right-click shows the mode (embedded or fallback),
+Left-click opens Task Manager. Right-click shows the mode (embedded or fallback), what WSL polling sees,
 Open Task Manager and Exit. Only one instance runs at a time.
 
 ## Layout
@@ -39,6 +39,7 @@ Open Task Manager and Exit. Only one instance runs at a time.
 | --- | --- |
 | `src/main.rs` | Windows, message loop, placement, menu |
 | `src/sampler.rs` | Sampler thread: GlobalMemoryStatusEx + PDH `\Process(*)\Working Set` |
+| `src/wsl.rs` | wsl.exe calls, only while the VM and a distro are already running |
 | `src/render.rs` | Direct2D/DirectWrite into a premultiplied DIB, UpdateLayeredWindow |
 | `src/taskbar.rs` | Finding the taskbar, alignment, Widgets setting, position |
 | `src/theme.rs` | Light/dark from `SystemUsesLightTheme`, colors |
