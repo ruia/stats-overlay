@@ -16,7 +16,7 @@ jobs:
       # Pinned so new lints in a later Rust release don't fail CI unannounced.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97.0"
+          toolchain: "1.99"
       - run: cargo build --release
       - name: Publish
         shell: pwsh
