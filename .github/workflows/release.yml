@@ -1,0 +1,26 @@
+name: Release
+
+# Push a tag like v0.2.0 to build statsoverlay.exe and publish it as a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = "target/release/statsoverlay.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  statsoverlay.exe" | Out-File -Encoding ascii statsoverlay.exe.sha256
+          gh release create "${{ github.ref_name }}" $exe statsoverlay.exe.sha256 --generate-notes --title "${{ github.ref_name }}"

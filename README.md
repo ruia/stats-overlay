@@ -1,5 +1,7 @@
 # StatsOverlay
 
+[![CI](https://github.com/ruia/stats-overlay/actions/workflows/ci.yml/badge.svg)](https://github.com/ruia/stats-overlay/actions/workflows/ci.yml)
+
 **A tiny RAM / CPU / GPU / disk monitor inside the Windows 11 taskbar, that also
 tells you how much of it is Windows and how much is WSL.**
 
@@ -85,7 +87,7 @@ Left-click opens Task Manager. Display settings are stored under
 
 ## Install
 
-Download `statsoverlay.exe` from Releases and run it. To start it with
+Download `statsoverlay.exe` from [Releases](https://github.com/ruia/stats-overlay/releases) and run it. To start it with
 Windows, use right-click > Start with Windows. To remove it: untick that,
 Exit, and delete the exe (and optionally `HKCU\Software\StatsOverlay`).
 
@@ -100,6 +102,20 @@ cargo build --release
 
 Output: `target\release\statsoverlay.exe`. Cross-compiling with
 `--target x86_64-pc-windows-gnu` also works (needs MinGW's `windres`).
+
+### Releasing
+
+CI (`.github/workflows/ci.yml`) checks formatting, runs clippy and the tests, and
+builds on every push and pull request; the exe is attached to each run. To
+publish a release, bump `version` in `Cargo.toml`, then tag and push:
+
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+`release.yml` builds it and creates the GitHub release with `statsoverlay.exe`
+and its SHA-256.
 
 ### Command line
 
