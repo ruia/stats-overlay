@@ -1,9 +1,12 @@
 //! Sampler thread: collects a snapshot every 2 s and pokes the UI thread.
 //! The UI never queries anything itself; it only redraws from the latest snapshot.
 
+use crate::disk::{self, DiskSnap};
 use crate::metrics::{self, Gpu};
 use crate::procs::{self, ProcMem};
-use crate::wsl::{self, LinuxMem, Reclaim};
+use crate::wsl::{self, LinuxMem};
+use crate::wslconfig::{self, WslConfig};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,6 +19,8 @@ const INTERVAL: Duration = Duration::from_secs(2);
 /// Longer than the time a distro waits idle before stopping, so polling never keeps
 /// a distro (and with it the VM) alive after you close your terminals.
 const WSL_INTERVAL: Duration = Duration::from_secs(30);
+/// Disk usage moves slowly; `df` inside a distro is the only non-trivial part.
+const DISK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Set after a WSL action (reclaim, shutdown) so the next sample re-reads WSL.
 static WSL_RECHECK: AtomicBool = AtomicBool::new(false);
@@ -52,7 +57,8 @@ pub struct Snapshot {
     pub wsl_state: WslState,
     /// Linux's own view, refreshed every WSL_INTERVAL while a distro runs.
     pub linux: Option<LinuxMem>,
-    pub reclaim: Reclaim,
+    /// .wslconfig, re-read every WSL_INTERVAL and after a change from the menu.
+    pub wslconfig: WslConfig,
     /// (committed, limit).
     pub commit: Option<(u64, u64)>,
     /// Task Manager's CPU %, None until the second sample.
@@ -85,6 +91,8 @@ impl Snapshot {
 }
 
 pub static LATEST: Mutex<Option<Snapshot>> = Mutex::new(None);
+/// Kept apart from Snapshot, which is Copy and refreshed 30x as often.
+pub static DISK: Mutex<Option<DiskSnap>> = Mutex::new(None);
 
 pub fn spawn(notify: HWND, cpu: bool, gpu: bool) {
     let notify = notify.0 as usize;
@@ -95,8 +103,13 @@ pub fn spawn(notify: HWND, cpu: bool, gpu: bool) {
             let pdh = metrics::Pdh::open(cpu, gpu);
             let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
             let mut wsl_checked: Option<Instant> = None;
-            let mut reclaim_checked: Option<Instant> = None;
-            let (mut wsl_state, mut linux, mut reclaim) = (WslState::Off, None, Reclaim::NotSet);
+            let mut config_checked: Option<Instant> = None;
+            let mut disk_checked: Option<Instant> = None;
+            let (mut wsl_state, mut linux, mut config) =
+                (WslState::Off, None, WslConfig::default());
+            let mut running: Vec<String> = Vec::new();
+            // A stopped distro's disk doesn't change, so its last `df` stays valid.
+            let mut df: HashMap<String, u64> = HashMap::new();
             let mut last_vm_cpu: Option<(Instant, u64)> = None;
             loop {
                 let mut snap = sample();
@@ -120,26 +133,37 @@ pub fn spawn(notify: HWND, cpu: bool, gpu: bool) {
                 if snap.vm.is_none() {
                     // VM stopped: never call wsl.exe, it would boot the VM.
                     (wsl_state, linux, wsl_checked) = (WslState::Off, None, None);
+                    running.clear();
                 } else if recheck || wsl_checked.is_none_or(|t| t.elapsed() >= WSL_INTERVAL) {
                     wsl_checked = Some(Instant::now());
-                    let distros = wsl::running_distros();
+                    running = wsl::running_distros();
+                    let distros = &running;
                     (wsl_state, linux) = if distros.is_empty() {
                         (WslState::NoDistro, None)
                     } else {
                         (
                             WslState::Running,
-                            wsl::meminfo_any(&distros).map(|(_, m)| m).or(linux),
+                            wsl::meminfo_any(distros).map(|(_, m)| m).or(linux),
                         )
                     };
                 } else if wsl_state == WslState::Off {
                     wsl_state = WslState::NoDistro;
                 }
-                if recheck || reclaim_checked.is_none_or(|t| t.elapsed() >= WSL_INTERVAL) {
+                if recheck || config_checked.is_none_or(|t| t.elapsed() >= WSL_INTERVAL) {
                     // A small file read; .wslconfig changes rarely.
-                    reclaim_checked = Some(now);
-                    reclaim = wsl::auto_memory_reclaim();
+                    config_checked = Some(now);
+                    config = wslconfig::read();
                 }
-                (snap.wsl_state, snap.linux, snap.reclaim) = (wsl_state, linux, reclaim);
+                (snap.wsl_state, snap.linux, snap.wslconfig) = (wsl_state, linux, config);
+                if recheck || disk_checked.is_none_or(|t| t.elapsed() >= DISK_INTERVAL) {
+                    disk_checked = Some(now);
+                    for d in running.iter().filter(|d| !d.starts_with("docker-desktop")) {
+                        if let Some(used) = wsl::root_used(d) {
+                            df.insert(d.clone(), used);
+                        }
+                    }
+                    *DISK.lock().unwrap() = Some(disk::read(|name| df.get(name).copied()));
+                }
                 *LATEST.lock().unwrap() = Some(snap);
                 unsafe {
                     let _ =
@@ -163,7 +187,7 @@ fn sample() -> Snapshot {
         compressed: special.compression.map_or(0, |c| c.working_set),
         wsl_state: WslState::Off,
         linux: None,
-        reclaim: Reclaim::NotSet,
+        wslconfig: WslConfig::default(),
         commit: metrics::commit(),
         cpu: None,
         wsl_cpu: None,

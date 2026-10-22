@@ -114,6 +114,11 @@ impl Renderer {
         }
     }
 
+    /// Forgets the sticky column widths, e.g. after the columns changed meaning.
+    pub fn reset_widths(&mut self) {
+        self.widths.clear();
+    }
+
     pub fn set_background(&mut self, background: Option<(D2D1_COLOR_F, D2D1_COLOR_F)>) {
         self.style.background = background;
     }

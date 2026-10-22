@@ -16,6 +16,9 @@ pub struct Palette {
     pub value: D2D1_COLOR_F,
     pub warn: D2D1_COLOR_F,
     pub crit: D2D1_COLOR_F,
+    /// Owner names in the "Windows / WSL rows" layout.
+    pub win: D2D1_COLOR_F,
+    pub wsl: D2D1_COLOR_F,
     /// Hover panel (fill, border).
     pub panel: (D2D1_COLOR_F, D2D1_COLOR_F),
 }
@@ -41,6 +44,8 @@ pub fn palette(light: bool) -> Palette {
             value: rgb(0x1a1a1a),
             warn: rgb(0x9d5d00),
             crit: rgb(0xc42b1c),
+            win: rgb(0x0a5bb5),
+            wsl: rgb(0xa14a00),
             panel: (rgba(0xf3f3f3, 0.98), rgb(0xd5d5d5)),
         }
     } else {
@@ -49,6 +54,8 @@ pub fn palette(light: bool) -> Palette {
             value: rgb(0xf3f3f3),
             warn: rgb(0xfce100),
             crit: rgb(0xff99a4),
+            win: rgb(0x7fb8ff),
+            wsl: rgb(0xffb070),
             panel: (rgba(0x2b2b2b, 0.98), rgb(0x474747)),
         }
     }

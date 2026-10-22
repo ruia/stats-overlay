@@ -2,6 +2,9 @@
 
 use crate::util::{pcwstr, reg_dword, wide};
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetWindowRect};
@@ -48,6 +51,24 @@ pub fn tray_rect(taskbar: HWND) -> Option<RECT> {
     let class = wide("TrayNotifyWnd");
     let h = unsafe { FindWindowExW(Some(taskbar), None, pcwstr(&class), None).ok()? };
     Some(rect(h))
+}
+
+/// True when the taskbar sits at the top of its monitor (ExplorerPatcher,
+/// StartAllBack or the StuckRects3 tweak); popups then open downwards.
+pub fn at_top(taskbar: HWND) -> bool {
+    let r = rect(taskbar);
+    let mut mi = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let m = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
+        if !GetMonitorInfoW(m, &mut mi).as_bool() {
+            return false;
+        }
+    }
+    let mon = mi.rcMonitor;
+    r.top - mon.top < mon.bottom - r.bottom
 }
 
 pub struct Placement {

@@ -1,14 +1,35 @@
 # StatsOverlay
 
 A tiny resource readout embedded in the Windows 11 taskbar, showing how much RAM
-(and later disk) Windows and WSL2 are using. Single portable .exe, no runtime.
+and disk Windows and WSL2 are using. Single portable .exe, no runtime.
 
-Status: **v1**.
+Status: **v2** (disk, display options, WSL settings).
+
+Three layouts, picked from right-click > Display:
 
 ```
-WIN 20.8G   WSL 29.2G   CPU 12%
-ALL 50.0/63.9G  CMT 94%   GPU 4%
+Grid:      WIN 20.8G   ALL 50.0/63.9G   CPU 12%   C: 412/931G
+           WSL 29.2G   CMT 94%          GPU  4%   VHD 86G ↓31G
+By owner:  WIN  20.8G ram   326G disk   8% cpu    CMT 94%
+           WSL  29.2G ram   86G ↓31G    4% cpu    GPU  4%
+Compact:   WIN 20.8G
+           WSL 29.2G
 ```
+
+CPU, GPU, commit and disk can each be hidden. Settings live in
+`HKCU\Software\StatsOverlay`.
+
+**Disk.** VHD is the space WSL's virtual disks (every WSL 2 distro's `ext4.vhdx`
+and Docker Desktop's `docker_data.vhdx`) take on the drive. ↓ is what Linux has
+freed inside them but the files still hold, known only for distros that ran since
+StatsOverlay started (it asks `df` inside running distros, every 60 s). "Windows"
+disk is the drive's used space minus those files.
+
+**WSL settings.** Right-click > WSL settings edits `%USERPROFILE%\.wslconfig`:
+`autoMemoryReclaim` (gradual / dropCache / disabled / not set) and the VM memory
+limit (`[wsl2] memory`). Other lines and comments are kept; the original is
+copied once to `.wslconfig.statsoverlay-backup`. Changes apply when WSL restarts,
+and it offers to restart it.
 
 CMT is commit charge (committed / commit limit). Running out of commit, not RAM,
 is what makes allocations fail on Windows, and the WSL VM can push it high.
@@ -52,8 +73,8 @@ Output: `target\release\statsoverlay.exe`.
 | `statsoverlay.exe --diag` | Writes `statsoverlay-diag.txt` next to the exe and opens it. |
 
 Left-click opens Task Manager. Right-click: Reclaim WSL cache (drops Linux's page
-cache, only while a distro runs), Shut down WSL (asks first), Open Task Manager,
-Start with Windows (HKCU Run key), Exit. Only one instance runs at a time.
+cache, only while a distro runs), WSL settings, Shut down WSL (asks first),
+Display, Open Task Manager, Start with Windows (HKCU Run key), Exit. Only one instance runs at a time.
 
 ## Layout
 
@@ -63,10 +84,13 @@ Start with Windows (HKCU Run key), Exit. Only one instance runs at a time.
 | `src/sampler.rs` | Sampler thread: GlobalMemoryStatusEx, VM and compression accounting |
 | `src/metrics.rs` | PDH (CPU utility, GPU 3D engines, VRAM) and commit charge |
 | `src/startup.rs` | Start with Windows |
+| `src/config.rs` | Display settings (layout, shown columns) in the registry |
+| `src/disk.rs` | Drives and WSL/Docker VHDX sizes |
+| `src/wslconfig.rs` | Reading and editing `.wslconfig` |
 | `src/procs.rs` | Per-process memory via NtQuerySystemInformation (what Task Manager uses) |
 | `src/wsl.rs` | wsl.exe calls, only while the VM and a distro are already running |
 | `src/render.rs` | Direct2D/DirectWrite into a premultiplied DIB, UpdateLayeredWindow |
-| `src/taskbar.rs` | Finding the taskbar, alignment, Widgets setting, position |
+| `src/taskbar.rs` | Finding the taskbar, alignment, Widgets setting, position, top/bottom |
 | `src/theme.rs` | Light/dark from `SystemUsesLightTheme`, colors |
 | `src/diag.rs` | `--diag` report |
 | `build.rs`, `app.manifest` | Embeds the manifest through the MSVC linker |

@@ -15,7 +15,9 @@
 
 #![windows_subsystem = "windows"]
 
+mod config;
 mod diag;
+mod disk;
 mod metrics;
 mod procs;
 mod render;
@@ -25,13 +27,16 @@ mod taskbar;
 mod theme;
 mod util;
 mod wsl;
+mod wslconfig;
 
+use config::{Config, Layout, Toggle};
+use disk::DiskSnap;
 use render::{seg, Column, Renderer, Seg, Style};
 use sampler::{Snapshot, WslState, WM_APP_SAMPLE};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use theme::Palette;
-use util::{gib, GIB};
+use util::{gib, wide, GIB};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -46,12 +51,31 @@ use windows::Win32::UI::Shell::{
     QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+use wslconfig::Reclaim;
 
 const ID_TASKMGR: usize = 1;
 const ID_EXIT: usize = 2;
 const ID_RECLAIM: usize = 3;
 const ID_SHUTDOWN: usize = 4;
 const ID_STARTUP: usize = 5;
+const ID_WSLCONFIG_OPEN: usize = 6;
+/// + index into Layout::ALL.
+const ID_LAYOUT: usize = 100;
+/// + index into Toggle::ALL.
+const ID_TOGGLE: usize = 110;
+/// + index into RECLAIM_CHOICES.
+const ID_RECLAIM_MODE: usize = 120;
+/// + index into MEMORY_CHOICES.
+const ID_MEMORY: usize = 130;
+
+const RECLAIM_CHOICES: [(Reclaim, &str); 4] = [
+    (Reclaim::NotSet, "Not set (WSL default)"),
+    (Reclaim::Gradual, "Gradual"),
+    (Reclaim::DropCache, "Drop cache when idle"),
+    (Reclaim::Disabled, "Off"),
+];
+/// GB; None removes the setting (WSL's default, 50% of RAM).
+const MEMORY_CHOICES: [Option<u32>; 6] = [None, Some(8), Some(16), Some(24), Some(32), Some(48)];
 const WM_DPICHANGED_AFTERPARENT: u32 = 0x02E3;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -75,6 +99,7 @@ struct App {
     light: Cell<bool>,
     msg_taskbar_created: u32,
     opts: Opts,
+    config: Cell<Config>,
     strip: RefCell<Option<Renderer>>,
     panel_renderer: RefCell<Option<Renderer>>,
 }
@@ -143,6 +168,7 @@ fn main() {
             light: Cell::new(theme::system_light()),
             msg_taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             opts,
+            config: Cell::new(Config::load()),
             strip: RefCell::new(
                 Renderer::new(Style {
                     font_dip: 12.0,
@@ -207,6 +233,31 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             }
             ID_STARTUP => {
                 startup::set(!startup::enabled());
+            }
+            ID_WSLCONFIG_OPEN => open_wslconfig(),
+            id @ ID_LAYOUT..ID_TOGGLE => {
+                if let Some(&l) = Layout::ALL.get(id - ID_LAYOUT) {
+                    let mut c = app.config.get();
+                    c.set_layout(l);
+                    set_config(c);
+                }
+            }
+            id @ ID_TOGGLE..ID_RECLAIM_MODE => {
+                if let Some(&t) = Toggle::ALL.get(id - ID_TOGGLE) {
+                    let mut c = app.config.get();
+                    c.flip(t);
+                    set_config(c);
+                }
+            }
+            id @ ID_RECLAIM_MODE..ID_MEMORY => {
+                if let Some(&(r, _)) = RECLAIM_CHOICES.get(id - ID_RECLAIM_MODE) {
+                    wslconfig_changed(wslconfig::set_reclaim(r));
+                }
+            }
+            id @ ID_MEMORY..140 => {
+                if let Some(&gb) = MEMORY_CHOICES.get(id - ID_MEMORY) {
+                    wslconfig_changed(wslconfig::set_memory(gb));
+                }
             }
             ID_EXIT => unsafe {
                 hide_panel();
@@ -377,7 +428,7 @@ fn refresh() {
         return;
     };
     let Ok((width, height)) = renderer.prepare(
-        &strip_columns(&snap, &palette()),
+        &strip_columns(&snap, disk_snap().as_ref(), &app.config.get(), &palette()),
         scale,
         Some(r.bottom - r.top),
     ) else {
@@ -430,72 +481,163 @@ fn pct(v: f64) -> String {
     format!("{v:.0}%")
 }
 
+/// "412/931G"
+fn of(used: u64, total: u64) -> String {
+    format!("{}/{}", gib(used).trim_end_matches('G'), gib(total))
+}
+
+fn disk_snap() -> Option<DiskSnap> {
+    sampler::DISK.lock().unwrap().clone()
+}
+
+/// Lines of the strip, per layout. Hidden or unavailable metrics drop out, and so
+/// do columns left empty.
+///
 /// ```text
-/// WIN 20.8G   WSL 29.2G   CPU 12%
-/// ALL 50.0/63.9G  CMT 94%   GPU  4%
+/// Grid:      WIN 20.8G   ALL 50.0/63.9G   CPU 12%   C: 412/931G
+///            WSL 29.2G   CMT 94%          GPU  4%   VHD 86G ↓31G
+/// By owner:  WIN  20.8G ram   326G disk   8% cpu    CMT 94%
+///            WSL  29.2G ram   86G ↓31G    4% cpu    GPU  4%
+/// Compact:   WIN 20.8G
+///            WSL 29.2G
 /// ```
-fn strip_columns(s: &Snapshot, p: &Palette) -> Vec<Column> {
-    let ram_frac = s.used as f64 / s.total.max(1) as f64;
-    let wsl = match s.vm {
+fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -> Vec<Column> {
+    let label = |t: &str| seg(t, p.label, false);
+    let none = || seg("–", p.label, false);
+    let frac = |a: u64, b: u64| a as f64 / b.max(1) as f64;
+    let wsl_ram = match s.vm {
         Some(_) => seg(gib(s.vm_ram()), p.value, true),
         None => seg("off", p.label, false),
     };
-    let commit = match s.commit {
-        Some((c, l)) => seg(
-            pct(c as f64 / l.max(1) as f64 * 100.0),
-            theme::level(p, c as f64 / l.max(1) as f64),
-            true,
-        ),
-        None => seg("–", p.label, false),
+    let commit = || match s.commit {
+        Some((u, l)) => seg(pct(frac(u, l) * 100.0), theme::level(p, frac(u, l)), true),
+        None => none(),
     };
     let percent = |v: Option<f64>| match v {
         Some(v) => seg(pct(v), theme::level(p, v / 100.0), true),
-        None => seg("–", p.label, false),
+        None => none(),
     };
-    vec![
-        vec![
-            vec![
-                seg("WIN ", p.label, false),
-                seg(gib(s.windows()), p.value, true),
-            ],
-            vec![
-                seg("ALL ", p.label, false),
-                seg(
-                    format!("{}/{}", gib(s.used).trim_end_matches('G'), gib(s.total)),
-                    theme::level(p, ram_frac),
-                    true,
-                ),
-            ],
-        ],
-        vec![
-            vec![seg("WSL ", p.label, false), wsl],
-            vec![seg("CMT ", p.label, false), commit],
-        ],
-        vec![
-            vec![seg("CPU ", p.label, false), percent(s.cpu)],
-            vec![
-                seg("GPU ", p.label, false),
-                percent(s.gpu.map(|g| g.percent)),
-            ],
-        ],
-    ]
+    let gpu = || percent(s.gpu.map(|g| g.percent));
+    let system = d.and_then(DiskSnap::system).filter(|_| c.disk);
+    let vhd = |line: &mut Vec<Seg>| {
+        if let Some(d) = d {
+            line.push(seg(gib(d.vhd_total()), p.value, true));
+            if let Some(r) = d.reclaimable().filter(|&r| r >= 1 << 30) {
+                line.push(label(&format!(" ↓{}", gib(r))));
+            }
+        }
+    };
+
+    let mut cols: Vec<Column> = match c.layout {
+        Layout::Compact => vec![vec![
+            vec![label("WIN "), seg(gib(s.windows()), p.value, true)],
+            vec![label("WSL "), wsl_ram],
+        ]],
+        Layout::Grid => {
+            let mut cols = vec![
+                vec![
+                    vec![label("WIN "), seg(gib(s.windows()), p.value, true)],
+                    vec![label("WSL "), wsl_ram],
+                ],
+                vec![vec![
+                    label("ALL "),
+                    seg(
+                        of(s.used, s.total),
+                        theme::level(p, frac(s.used, s.total)),
+                        true,
+                    ),
+                ]],
+            ];
+            if c.commit {
+                cols[1].push(vec![label("CMT "), commit()]);
+            }
+            let mut cg = Vec::new();
+            if c.cpu {
+                cg.push(vec![label("CPU "), percent(s.cpu)]);
+            }
+            if c.gpu {
+                cg.push(vec![label("GPU "), gpu()]);
+            }
+            cols.push(cg);
+            if let Some(sys) = system {
+                let mut v = vec![label("VHD ")];
+                vhd(&mut v);
+                cols.push(vec![
+                    vec![
+                        label(&format!("{}: ", sys.letter)),
+                        seg(
+                            of(sys.used(), sys.total),
+                            theme::level(p, frac(sys.used(), sys.total)),
+                            true,
+                        ),
+                    ],
+                    v,
+                ]);
+            }
+            cols
+        }
+        Layout::ByOwner => {
+            let owner = |t: &str, color| seg(t, color, true);
+            let mut cols = vec![
+                vec![vec![owner("WIN", p.win)], vec![owner("WSL", p.wsl)]],
+                vec![
+                    vec![seg(gib(s.windows()), p.value, true), label(" ram")],
+                    vec![wsl_ram, label(" ram")],
+                ],
+            ];
+            if let (Some(sys), Some(d)) = (system, d) {
+                let mut v = Vec::new();
+                vhd(&mut v);
+                cols.push(vec![
+                    vec![
+                        seg(gib(d.windows_used(&sys)), p.value, true),
+                        label(" disk"),
+                    ],
+                    v,
+                ]);
+            }
+            if c.cpu {
+                let win = s.cpu.map(|t| (t - s.wsl_cpu.unwrap_or(0.0)).max(0.0));
+                let wsl = s.wsl_cpu.or(s.vm.is_none().then_some(0.0));
+                cols.push(vec![
+                    vec![percent(win), label(" cpu")],
+                    vec![percent(wsl), label(" cpu")],
+                ]);
+            }
+            let mut extra = Vec::new();
+            if c.commit {
+                extra.push(vec![label("CMT "), commit()]);
+            }
+            if c.gpu {
+                extra.push(vec![label("GPU "), gpu()]);
+            }
+            cols.push(extra);
+            cols
+        }
+    };
+    cols.retain(|c| !c.is_empty());
+    cols
 }
 
-/// The hover breakdown: a label column and a value column.
-fn panel_columns(s: &Snapshot, p: &Palette, embedded: bool) -> Vec<Column> {
+/// The hover breakdown in sections; a label column and a value column.
+fn panel_columns(s: &Snapshot, d: Option<&DiskSnap>, p: &Palette, embedded: bool) -> Vec<Column> {
     let mut labels: Column = Vec::new();
     let mut values: Column = Vec::new();
-    let mut row = |label: &str, value: Vec<Seg>| {
-        labels.push(vec![seg(label, p.label, false)]);
+    let mut row = |label: Seg, value: Vec<Seg>| {
+        labels.push(vec![label]);
         values.push(value);
     };
+    let l = |t: &str| seg(t, p.label, false);
     let v = |t: String| seg(t, p.value, true);
     let dim = |t: String| seg(t, p.label, false);
     let g = |b: u64| format!("{:.1}G", b as f64 / GIB);
+    let gd = |b: u64| gib(b);
+    let head = |t: &str| seg(t, p.label, true);
 
+    row(head("MEMORY"), vec![]);
     let ram_frac = s.used as f64 / s.total.max(1) as f64;
     row(
-        "Memory in use",
+        l("In use"),
         vec![
             seg(
                 format!("{} / {}", g(s.used), g(s.total)),
@@ -505,69 +647,122 @@ fn panel_columns(s: &Snapshot, p: &Palette, embedded: bool) -> Vec<Column> {
             dim(format!("  {}", pct(ram_frac * 100.0))),
         ],
     );
-    row("   Windows", vec![v(g(s.windows()))]);
+    row(l("   Windows"), vec![v(g(s.windows()))]);
     match s.vm {
-        Some(vm) => {
-            row(
-                "   WSL VM",
-                vec![
-                    v(g(s.vm_ram())),
-                    dim(format!(
-                        "  {} in RAM + {} compressed",
-                        g(vm.working_set),
-                        g(s.vm_compressed())
-                    )),
-                ],
-            );
-            row(
-                "   VM committed",
-                vec![
-                    v(g(vm.private)),
-                    dim("  RAM, compressed and page file".into()),
-                ],
-            );
-        }
-        None => row("   WSL VM", vec![dim("off".into())]),
+        Some(vm) => row(
+            l("   WSL VM"),
+            vec![
+                v(g(s.vm_ram())),
+                dim(format!(
+                    "  {} RAM + {} compressed",
+                    g(vm.working_set),
+                    g(s.vm_compressed())
+                )),
+            ],
+        ),
+        None => row(l("   WSL VM"), vec![dim("off".into())]),
     }
+    if let Some((c, lim)) = s.commit {
+        let f = c as f64 / lim.max(1) as f64;
+        let mut val = vec![
+            seg(format!("{} / {}", g(c), g(lim)), theme::level(p, f), true),
+            dim(format!("  {}", pct(f * 100.0))),
+        ];
+        if let Some(vm) = s.vm {
+            val.push(dim(format!(" · VM holds {}", g(vm.private))));
+        }
+        row(l("Commit"), val);
+    }
+
+    row(l(""), vec![]);
+    row(head("WSL"), vec![]);
     let linux = match (s.wsl_state, s.linux) {
-        (WslState::Running, Some(l)) => vec![
-            v(format!("used {}", g(l.used()))),
-            dim(format!("  cache {}", g(l.cache))),
+        (WslState::Running, Some(m)) => vec![
+            v(format!("used {}", g(m.used()))),
+            dim(format!("  cache {}", g(m.cache))),
         ],
         (WslState::Running, None) => vec![dim("meminfo unavailable".into())],
         (WslState::NoDistro, _) => vec![dim("no distro running (not polled)".into())],
         (WslState::Off, _) => vec![dim("VM off".into())],
     };
-    row("Linux", linux);
-    row("autoMemoryReclaim", vec![v(s.reclaim.label().into())]);
-    if let Some((c, l)) = s.commit {
-        let f = c as f64 / l.max(1) as f64;
-        row(
-            "Commit charge",
-            vec![
-                seg(format!("{} / {}", g(c), g(l)), theme::level(p, f), true),
-                dim(format!("  {}", pct(f * 100.0))),
+    row(l("Linux"), linux);
+    let wc = s.wslconfig;
+    row(
+        l("Memory reclaim"),
+        vec![
+            v(wc.reclaim.label().into()),
+            dim("  (right-click to change)".into()),
+        ],
+    );
+    row(
+        l("Memory limit"),
+        match wc.memory {
+            Some(m) => vec![v(gd(m))],
+            None => vec![
+                v("none".into()),
+                dim(format!("  VM may grow to {}", g(s.total / 2))),
             ],
-        );
-    }
-    let mut cpu = vec![v(s.cpu.map_or("–".into(), pct))];
+        },
+    );
     if let Some(w) = s.wsl_cpu {
-        cpu.push(dim(format!("  WSL {}", pct(w))));
+        row(l("CPU"), vec![v(pct(w))]);
     }
-    row("CPU", cpu);
+
+    if let Some(d) = d {
+        row(l(""), vec![]);
+        row(head("DISK"), vec![]);
+        for drive in &d.drives {
+            let f = drive.used() as f64 / drive.total.max(1) as f64;
+            row(
+                l(&format!("{}:", drive.letter)),
+                vec![
+                    seg(
+                        format!("{} / {}", gd(drive.used()), gd(drive.total)),
+                        theme::level(p, f),
+                        true,
+                    ),
+                    dim(format!(
+                        "  {} free · Windows {}",
+                        gd(drive.free),
+                        gd(d.windows_used(drive))
+                    )),
+                ],
+            );
+            for vhd in d.vhds.iter().filter(|x| x.drive() == Some(drive.letter)) {
+                let mut detail = String::new();
+                if let Some(u) = vhd.linux_used {
+                    detail.push_str(&format!("  Linux {}", gd(u)));
+                }
+                if let Some(r) = vhd.reclaimable() {
+                    detail.push_str(&format!(" · ↓{}", gd(r)));
+                }
+                detail.push_str(if vhd.sparse {
+                    " · sparse"
+                } else {
+                    " · not sparse"
+                });
+                row(
+                    l(&format!("   {}", vhd.name)),
+                    vec![v(gd(vhd.on_disk)), dim(detail)],
+                );
+            }
+        }
+    }
+
+    row(l(""), vec![]);
+    row(head("CPU · GPU"), vec![]);
+    row(l("CPU"), vec![v(s.cpu.map_or("–".into(), pct))]);
     let mut gpu = vec![v(s.gpu.map_or("–".into(), |x| pct(x.percent)))];
     if let Some(vram) = s.gpu.and_then(|x| x.vram) {
         gpu.push(dim(format!("  VRAM {}", g(vram))));
     }
-    row("GPU", gpu);
-    row(
-        "Mode",
-        vec![dim(if embedded {
-            "embedded in taskbar".into()
-        } else {
-            "overlay (fallback)".into()
-        })],
-    );
+    row(l("GPU"), gpu);
+    if !embedded {
+        row(
+            l("Mode"),
+            vec![dim("overlay (taskbar embedding failed)".into())],
+        );
+    }
     vec![labels, values]
 }
 
@@ -611,7 +806,7 @@ fn update_panel() {
     r.set_background(Some(p.panel));
     let scale = taskbar::dpi(tb) as f32 / 96.0;
     let Ok((w, h)) = r.prepare(
-        &panel_columns(&snap, &p, app.parent.get().is_some()),
+        &panel_columns(&snap, disk_snap().as_ref(), &p, app.parent.get().is_some()),
         scale,
         None,
     ) else {
@@ -623,7 +818,13 @@ fn update_panel() {
         let _ = GetWindowRect(strip, &mut sr);
     }
     let x = sr.left.clamp(tbr.left, (tbr.right - w).max(tbr.left));
-    let y = tbr.top - h - (6.0 * scale) as i32;
+    let gap = (6.0 * scale) as i32;
+    // Above the taskbar, or below it when the taskbar is at the top of its screen.
+    let y = if taskbar::at_top(tb) {
+        tbr.bottom + gap
+    } else {
+        tbr.top - h - gap
+    };
     unsafe {
         let _ = SetWindowPos(
             panel,
@@ -684,49 +885,191 @@ fn open_task_manager() {
     }
 }
 
+fn set_config(c: Config) {
+    app().config.set(c);
+    if let Some(r) = app().strip.borrow_mut().as_mut() {
+        r.reset_widths();
+    }
+    refresh();
+}
+
+/// After .wslconfig was written: re-read it, and offer to restart WSL so it applies.
+fn wslconfig_changed(result: std::io::Result<()>) {
+    let host = app().host.get();
+    sampler::request_wsl_recheck();
+    unsafe {
+        let _ = SetForegroundWindow(host);
+        if let Err(e) = result {
+            let text = wide(&format!("Couldn't update .wslconfig:\n\n{e}"));
+            MessageBoxW(
+                Some(host),
+                util::pcwstr(&text),
+                w!("StatsOverlay"),
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+        let vm_up = latest().is_some_and(|s| s.vm.is_some());
+        if !vm_up || ACTION_BUSY.load(Ordering::Acquire) {
+            return; // Applies next time WSL starts.
+        }
+        let restart = MessageBoxW(
+            Some(host),
+            w!("Saved to .wslconfig. It applies the next time WSL starts.\n\nRestart WSL now? This stops every running distro, including Docker Desktop's engine."),
+            w!("StatsOverlay"),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) == IDYES;
+        if restart {
+            run_action(|| {
+                wsl::shutdown();
+            });
+        }
+    }
+}
+
+fn open_wslconfig() {
+    let Some(path) = wslconfig::path() else {
+        return;
+    };
+    let p = wide(&path.to_string_lossy());
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            w!("notepad.exe"),
+            util::pcwstr(&p),
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+fn menu_item(menu: HMENU, on: bool, checked: bool, id: usize, text: &str) {
+    let mut flags = MF_STRING;
+    if !on {
+        flags |= MF_GRAYED;
+    }
+    if checked {
+        flags |= MF_CHECKED;
+    }
+    let t = wide(text);
+    unsafe {
+        let _ = AppendMenuW(menu, flags, id, util::pcwstr(&t));
+    }
+}
+
+fn submenu(menu: HMENU, sub: HMENU, text: &str) {
+    let t = wide(text);
+    unsafe {
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, util::pcwstr(&t));
+    }
+}
+
+fn separator(menu: HMENU) {
+    unsafe {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
+}
+
+fn display_menu() -> Option<HMENU> {
+    let c = app().config.get();
+    let m = unsafe { CreatePopupMenu().ok()? };
+    for (i, l) in Layout::ALL.iter().enumerate() {
+        menu_item(m, true, c.layout == *l, ID_LAYOUT + i, l.label());
+    }
+    separator(m);
+    for (i, t) in Toggle::ALL.iter().enumerate() {
+        // Compact shows memory only.
+        menu_item(
+            m,
+            c.layout != Layout::Compact,
+            c.shows(*t),
+            ID_TOGGLE + i,
+            t.label(),
+        );
+    }
+    Some(m)
+}
+
+fn wsl_settings_menu() -> Option<HMENU> {
+    let wc = wslconfig::read();
+    let m = unsafe { CreatePopupMenu().ok()? };
+    menu_item(m, false, false, 0, "Memory reclaim");
+    for (i, (r, label)) in RECLAIM_CHOICES.iter().enumerate() {
+        menu_item(
+            m,
+            true,
+            wc.reclaim == *r,
+            ID_RECLAIM_MODE + i,
+            &format!("    {label}"),
+        );
+    }
+    separator(m);
+    menu_item(m, false, false, 0, "Memory limit");
+    let gb = wc.memory.map(|b| (b as f64 / GIB).round() as u32);
+    let standard = MEMORY_CHOICES.contains(&gb);
+    for (i, choice) in MEMORY_CHOICES.iter().enumerate() {
+        let label = match choice {
+            None => "    Default (50% of RAM)".to_string(),
+            Some(g) => format!("    {g} GB"),
+        };
+        menu_item(m, true, gb == *choice, ID_MEMORY + i, &label);
+    }
+    if !standard {
+        if let Some(b) = wc.memory {
+            menu_item(m, false, true, 0, &format!("    {} (custom)", gib(b)));
+        }
+    }
+    separator(m);
+    menu_item(m, true, false, ID_WSLCONFIG_OPEN, "Open .wslconfig");
+    menu_item(m, false, false, 0, "Changes apply after WSL restarts");
+    Some(m)
+}
+
 fn show_menu() {
     let host = app().host.get();
     let snap = latest();
     let busy = ACTION_BUSY.load(Ordering::Acquire);
     let running = snap.is_some_and(|s| s.wsl_state == WslState::Running);
     let vm_up = snap.is_some_and(|s| s.vm.is_some());
-    let flag = |on: bool| if on { MF_STRING } else { MF_STRING | MF_GRAYED };
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let _ = AppendMenuW(
+        menu_item(
             menu,
-            flag(running && !busy),
+            running && !busy,
+            false,
             ID_RECLAIM,
-            w!("Reclaim WSL cache"),
+            "Reclaim WSL cache",
         );
-        let _ = AppendMenuW(
+        if let Some(sub) = wsl_settings_menu() {
+            submenu(menu, sub, "WSL settings");
+        }
+        menu_item(menu, vm_up && !busy, false, ID_SHUTDOWN, "Shut down WSL…");
+        separator(menu);
+        if let Some(sub) = display_menu() {
+            submenu(menu, sub, "Display");
+        }
+        menu_item(menu, true, false, ID_TASKMGR, "Open Task Manager");
+        menu_item(
             menu,
-            flag(vm_up && !busy),
-            ID_SHUTDOWN,
-            w!("Shut down WSL…"),
-        );
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, ID_TASKMGR, w!("Open Task Manager"));
-        let checked = if startup::enabled() {
-            MF_CHECKED
-        } else {
-            MF_UNCHECKED
-        };
-        let _ = AppendMenuW(
-            menu,
-            MF_STRING | checked,
+            true,
+            startup::enabled(),
             ID_STARTUP,
-            w!("Start with Windows"),
+            "Start with Windows",
         );
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
+        separator(menu);
+        menu_item(menu, true, false, ID_EXIT, "Exit");
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
+        let vertical = match taskbar::find() {
+            Some(tb) if taskbar::at_top(tb) => TPM_TOPALIGN,
+            _ => TPM_BOTTOMALIGN,
+        };
         // Standard dance so the menu closes when clicking elsewhere.
         let _ = SetForegroundWindow(host);
         let _ = TrackPopupMenu(
             menu,
-            TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+            TPM_RIGHTBUTTON | vertical,
             pt.x,
             pt.y,
             None,
@@ -734,6 +1077,7 @@ fn show_menu() {
             None,
         );
         let _ = PostMessageW(Some(host), WM_NULL, WPARAM(0), LPARAM(0));
+        // Destroys the submenus too.
         let _ = DestroyMenu(menu);
     }
 }

@@ -147,63 +147,14 @@ pub fn shutdown() -> bool {
     wsl(&["--shutdown"]).is_some()
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Reclaim {
-    /// No %USERPROFILE%\.wslconfig.
-    NoConfig,
-    NotSet,
-    Gradual,
-    DropCache,
-    Disabled,
-    Unknown,
+/// Bytes used on the distro's root filesystem (its ext4.vhdx), from `df`.
+/// Only for running distros: it resets the distro's idle timer.
+pub fn root_used(distro: &str) -> Option<u64> {
+    let out = wsl(&["-d", distro, "-e", "df", "-B1", "/"])?;
+    parse_df(&String::from_utf8_lossy(&out))
 }
 
-impl Reclaim {
-    pub fn label(self) -> &'static str {
-        match self {
-            Reclaim::NoConfig => "not set (no .wslconfig)",
-            Reclaim::NotSet => "not set",
-            Reclaim::Gradual => "gradual",
-            Reclaim::DropCache => "dropcache",
-            Reclaim::Disabled => "disabled",
-            Reclaim::Unknown => "unrecognised value",
-        }
-    }
-}
-
-/// `autoMemoryReclaim` from %USERPROFILE%\.wslconfig ([experimental], also
-/// accepted under [wsl2]).
-pub fn auto_memory_reclaim() -> Reclaim {
-    let Some(home) = std::env::var_os("USERPROFILE") else {
-        return Reclaim::NoConfig;
-    };
-    let Ok(text) = std::fs::read_to_string(std::path::Path::new(&home).join(".wslconfig")) else {
-        return Reclaim::NoConfig;
-    };
-    parse_reclaim(&text)
-}
-
-fn parse_reclaim(text: &str) -> Reclaim {
-    let mut section = String::new();
-    for raw in text.lines() {
-        let line = raw.split(['#', ';']).next().unwrap_or("").trim();
-        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            section = s.trim().to_ascii_lowercase();
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case("autoMemoryReclaim")
-            && (section == "experimental" || section == "wsl2")
-        {
-            return match value.trim().trim_matches('"').to_ascii_lowercase().as_str() {
-                "gradual" => Reclaim::Gradual,
-                "dropcache" => Reclaim::DropCache,
-                "disabled" => Reclaim::Disabled,
-                _ => Reclaim::Unknown,
-            };
-        }
-    }
-    Reclaim::NotSet
+/// `df -B1` output: a header, then "fs 1B-blocks Used Available Use% Mounted".
+fn parse_df(text: &str) -> Option<u64> {
+    text.lines().nth(1)?.split_whitespace().nth(2)?.parse().ok()
 }

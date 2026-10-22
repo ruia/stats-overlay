@@ -125,7 +125,7 @@ pub fn run() {
         compressed: special.compression.map_or(0, |c| c.working_set),
         wsl_state: crate::sampler::WslState::Off,
         linux: None,
-        reclaim: crate::wsl::auto_memory_reclaim(),
+        wslconfig: crate::wslconfig::read(),
         commit: crate::metrics::commit(),
         cpu: None,
         wsl_cpu: None,
@@ -185,6 +185,50 @@ pub fn run() {
             }
         }
     }
+
+    let _ = writeln!(out, "\n== Disk ==");
+    let running = if vm_up {
+        crate::wsl::running_distros()
+    } else {
+        Vec::new()
+    };
+    let disk = crate::disk::read(|name| {
+        running
+            .iter()
+            .any(|r| r == name)
+            .then(|| crate::wsl::root_used(name))
+            .flatten()
+    });
+    for d in &disk.drives {
+        let _ = writeln!(
+            out,
+            "{}: total {:.2} GiB, used {:.2} GiB, free {:.2} GiB, not VHDX {:.2} GiB",
+            d.letter,
+            g(d.total),
+            g(d.used()),
+            g(d.free),
+            g(disk.windows_used(d))
+        );
+    }
+    for v in &disk.vhds {
+        let _ = writeln!(
+            out,
+            "{}: {} on disk {:.2} GiB, sparse {}, df used {:?} GiB",
+            v.name,
+            v.path.display(),
+            g(v.on_disk),
+            v.sparse,
+            v.linux_used.map(g)
+        );
+    }
+    let wc = crate::wslconfig::read();
+    let _ = writeln!(
+        out,
+        ".wslconfig: exists {}, autoMemoryReclaim {}, memory {:?} GiB",
+        wc.exists,
+        wc.reclaim.label(),
+        wc.memory.map(g)
+    );
 
     let path = std::env::current_exe()
         .ok()

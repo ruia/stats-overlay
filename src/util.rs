@@ -1,7 +1,10 @@
 use std::ffi::c_void;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::ERROR_SUCCESS;
-use windows::Win32::System::Registry::{RegGetValueW, HKEY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, KEY_READ, RRF_RT_REG_DWORD,
+    RRF_RT_REG_SZ,
+};
 
 /// NUL-terminated UTF-16 copy of `s`. Keep the Vec alive while the PCWSTR is in use.
 pub fn wide(s: &str) -> Vec<u16> {
@@ -50,6 +53,38 @@ pub fn reg_string(root: HKEY, path: &str, name: &str) -> Option<String> {
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     Some(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// Names of the subkeys of `path`.
+pub fn reg_subkeys(root: HKEY, path: &str) -> Vec<String> {
+    let p = wide(path);
+    let mut key = HKEY::default();
+    let mut out = Vec::new();
+    unsafe {
+        if RegOpenKeyExW(root, pcwstr(&p), None, KEY_READ, &mut key) != ERROR_SUCCESS {
+            return out;
+        }
+        let mut buf = [0u16; 256];
+        for i in 0.. {
+            let mut len = buf.len() as u32;
+            let r = RegEnumKeyExW(
+                key,
+                i,
+                Some(windows::core::PWSTR(buf.as_mut_ptr())),
+                &mut len,
+                None,
+                None,
+                None,
+                None,
+            );
+            if r != ERROR_SUCCESS {
+                break;
+            }
+            out.push(String::from_utf16_lossy(&buf[..len as usize]));
+        }
+        let _ = RegCloseKey(key);
+    }
+    out
 }
 
 pub const GIB: f64 = (1u64 << 30) as f64;
