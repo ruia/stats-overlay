@@ -54,7 +54,6 @@ pub struct Placement {
     /// Screen coordinates.
     pub x: i32,
     pub y: i32,
-    pub height: i32,
 }
 
 /// Where a strip `width` px wide goes. Centered taskbar: on the left, after the
@@ -75,9 +74,5 @@ pub fn place(taskbar: HWND, width: i32, offset_dip: Option<i32>) -> Placement {
         let right = tray_rect(taskbar).map_or(r.right, |t| t.left);
         right - width - px(MARGIN_DIP)
     };
-    Placement {
-        x,
-        y: r.top,
-        height: r.bottom - r.top,
-    }
+    Placement { x, y: r.top }
 }

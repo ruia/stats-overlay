@@ -1,9 +1,11 @@
-//! Sampler thread: collects a RAM snapshot every 2 s and pokes the UI thread.
+//! Sampler thread: collects a snapshot every 2 s and pokes the UI thread.
 //! The UI never queries anything itself; it only redraws from the latest snapshot.
 
+use crate::metrics::{self, Gpu};
 use crate::procs::{self, ProcMem};
-use crate::wsl::{self, LinuxMem};
-use std::sync::Mutex;
+use crate::wsl::{self, LinuxMem, Reclaim};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -14,6 +16,18 @@ const INTERVAL: Duration = Duration::from_secs(2);
 /// Longer than the time a distro waits idle before stopping, so polling never keeps
 /// a distro (and with it the VM) alive after you close your terminals.
 const WSL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Set after a WSL action (reclaim, shutdown) so the next sample re-reads WSL.
+static WSL_RECHECK: AtomicBool = AtomicBool::new(false);
+static SAMPLER: OnceLock<std::thread::Thread> = OnceLock::new();
+
+/// Re-reads WSL right away instead of at the next 30 s check.
+pub fn request_wsl_recheck() {
+    WSL_RECHECK.store(true, Ordering::Relaxed);
+    if let Some(t) = SAMPLER.get() {
+        t.unpark();
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum WslState {
@@ -38,6 +52,14 @@ pub struct Snapshot {
     pub wsl_state: WslState,
     /// Linux's own view, refreshed every WSL_INTERVAL while a distro runs.
     pub linux: Option<LinuxMem>,
+    pub reclaim: Reclaim,
+    /// (committed, limit).
+    pub commit: Option<(u64, u64)>,
+    /// Task Manager's CPU %, None until the second sample.
+    pub cpu: Option<f64>,
+    /// CPU used by the WSL VM, % of all logical processors.
+    pub wsl_cpu: Option<f64>,
+    pub gpu: Option<Gpu>,
 }
 
 impl Snapshot {
@@ -69,14 +91,36 @@ pub fn spawn(notify: HWND) {
     let _ = std::thread::Builder::new()
         .stack_size(256 * 1024)
         .spawn(move || {
+            let _ = SAMPLER.set(std::thread::current());
+            let pdh = metrics::Pdh::open();
+            let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
             let mut wsl_checked: Option<Instant> = None;
-            let (mut wsl_state, mut linux) = (WslState::Off, None);
+            let mut reclaim_checked: Option<Instant> = None;
+            let (mut wsl_state, mut linux, mut reclaim) = (WslState::Off, None, Reclaim::NotSet);
+            let mut last_vm_cpu: Option<(Instant, u64)> = None;
             loop {
                 let mut snap = sample();
+                if let Some(p) = &pdh {
+                    if p.collect() {
+                        snap.cpu = p.cpu();
+                        snap.gpu = p.gpu();
+                    }
+                }
+                let now = Instant::now();
+                snap.wsl_cpu = match (snap.vm, last_vm_cpu) {
+                    (Some(vm), Some((t, cpu))) if vm.cpu_time >= cpu => {
+                        let wall = now.duration_since(t).as_nanos() as f64 / 100.0;
+                        Some(((vm.cpu_time - cpu) as f64 / (wall * cpus) * 100.0).clamp(0.0, 100.0))
+                    }
+                    _ => None,
+                };
+                last_vm_cpu = snap.vm.map(|vm| (now, vm.cpu_time));
+
+                let recheck = WSL_RECHECK.swap(false, Ordering::Relaxed);
                 if snap.vm.is_none() {
                     // VM stopped: never call wsl.exe, it would boot the VM.
                     (wsl_state, linux, wsl_checked) = (WslState::Off, None, None);
-                } else if wsl_checked.is_none_or(|t| t.elapsed() >= WSL_INTERVAL) {
+                } else if recheck || wsl_checked.is_none_or(|t| t.elapsed() >= WSL_INTERVAL) {
                     wsl_checked = Some(Instant::now());
                     let distros = wsl::running_distros();
                     (wsl_state, linux) = if distros.is_empty() {
@@ -90,13 +134,21 @@ pub fn spawn(notify: HWND) {
                 } else if wsl_state == WslState::Off {
                     wsl_state = WslState::NoDistro;
                 }
-                (snap.wsl_state, snap.linux) = (wsl_state, linux);
+                if recheck || reclaim_checked.is_none_or(|t| t.elapsed() >= WSL_INTERVAL) {
+                    // A small file read; .wslconfig changes rarely.
+                    reclaim_checked = Some(now);
+                    reclaim = wsl::auto_memory_reclaim();
+                }
+                (snap.wsl_state, snap.linux, snap.reclaim) = (wsl_state, linux, reclaim);
                 *LATEST.lock().unwrap() = Some(snap);
                 unsafe {
                     let _ =
                         PostMessageW(Some(HWND(notify as _)), WM_APP_SAMPLE, WPARAM(0), LPARAM(0));
                 }
-                std::thread::sleep(INTERVAL);
+                // request_wsl_recheck() unparks us early.
+                if !WSL_RECHECK.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(INTERVAL);
+                }
             }
         });
 }
@@ -111,6 +163,11 @@ fn sample() -> Snapshot {
         compressed: special.compression.map_or(0, |c| c.working_set),
         wsl_state: WslState::Off,
         linux: None,
+        reclaim: Reclaim::NotSet,
+        commit: metrics::commit(),
+        cpu: None,
+        wsl_cpu: None,
+        gpu: None,
     }
 }
 

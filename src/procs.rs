@@ -14,6 +14,8 @@ pub struct ProcMem {
     pub working_set: u64,
     /// Committed private memory, wherever it is: RAM, compression store or page file.
     pub private: u64,
+    /// User + kernel CPU time, in 100 ns units.
+    pub cpu_time: u64,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -74,11 +76,15 @@ pub fn for_each(mut f: impl FnMut(&[u16], ProcMem)) -> bool {
                     )
                 }
             };
+            // Reserved1 is WorkingSetPrivateSize, HardFaultCount, NumberOfThreadsHighWatermark,
+            // CycleTime, CreateTime, UserTime, KernelTime (stable layout since Windows 7).
+            let time = |at: usize| u64::from_le_bytes(p.Reserved1[at..at + 8].try_into().unwrap());
             f(
                 name,
                 ProcMem {
                     working_set: p.WorkingSetSize as u64,
                     private: p.PrivatePageCount as u64,
+                    cpu_time: time(32) + time(40),
                 },
             );
             if p.NextEntryOffset == 0 {
@@ -105,6 +111,7 @@ pub fn special() -> Option<Special> {
         let e = slot.get_or_insert_default();
         e.working_set += m.working_set;
         e.private += m.private;
+        e.cpu_time += m.cpu_time;
     };
     let ok = for_each(|name, m| {
         if name_is(name, "vmmemWSL") {

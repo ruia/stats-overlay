@@ -125,6 +125,11 @@ pub fn run() {
         compressed: special.compression.map_or(0, |c| c.working_set),
         wsl_state: crate::sampler::WslState::Off,
         linux: None,
+        reclaim: crate::wsl::auto_memory_reclaim(),
+        commit: crate::metrics::commit(),
+        cpu: None,
+        wsl_cpu: None,
+        gpu: None,
     };
     let _ = writeln!(
         out,

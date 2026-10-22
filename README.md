@@ -3,12 +3,19 @@
 A tiny resource readout embedded in the Windows 11 taskbar, showing how much RAM
 (and later disk) Windows and WSL2 are using. Single portable .exe, no runtime.
 
-Status: **v0**, proving taskbar placement with a RAM line:
+Status: **v1**.
 
 ```
-WIN 9.1G   WSL 6.2G
-ALL 15.3/31.7G
+WIN 20.8G   WSL 29.2G   CPU 12%
+ALL 50.0/63.9G  CMT 94%   GPU 4%
 ```
+
+CMT is commit charge (committed / commit limit). Running out of commit, not RAM,
+is what makes allocations fail on Windows, and the WSL VM can push it high.
+
+Hover for the full breakdown: Windows vs WSL VM (in RAM, compressed, committed),
+Linux used and cache, `autoMemoryReclaim` from `.wslconfig`, commit charge,
+CPU (and WSL's share), GPU and VRAM.
 
 ## What the RAM numbers mean
 
@@ -43,8 +50,9 @@ Output: `target\release\statsoverlay.exe`.
 | `statsoverlay.exe --offset 120` | Left offset in logical px, instead of the Widgets-button guess. |
 | `statsoverlay.exe --diag` | Writes `statsoverlay-diag.txt` next to the exe and opens it. |
 
-Left-click opens Task Manager. Right-click shows the mode (embedded or fallback), what WSL polling sees,
-Open Task Manager and Exit. Only one instance runs at a time.
+Left-click opens Task Manager. Right-click: Reclaim WSL cache (drops Linux's page
+cache, only while a distro runs), Shut down WSL (asks first), Open Task Manager,
+Start with Windows (HKCU Run key), Exit. Only one instance runs at a time.
 
 ## Layout
 
@@ -52,6 +60,8 @@ Open Task Manager and Exit. Only one instance runs at a time.
 | --- | --- |
 | `src/main.rs` | Windows, message loop, placement, menu |
 | `src/sampler.rs` | Sampler thread: GlobalMemoryStatusEx, VM and compression accounting |
+| `src/metrics.rs` | PDH (CPU utility, GPU 3D engines, VRAM) and commit charge |
+| `src/startup.rs` | Start with Windows |
 | `src/procs.rs` | Per-process memory via NtQuerySystemInformation (what Task Manager uses) |
 | `src/wsl.rs` | wsl.exe calls, only while the VM and a distro are already running |
 | `src/render.rs` | Direct2D/DirectWrite into a premultiplied DIB, UpdateLayeredWindow |

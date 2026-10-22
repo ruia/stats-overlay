@@ -123,3 +123,87 @@ fn parse_meminfo(text: &str) -> Option<LinuxMem> {
         cache: field("Buffers").unwrap_or(0) + field("Cached").unwrap_or(0),
     })
 }
+
+/// Drops Linux's page cache so the VM can hand that memory back to Windows.
+/// VM-wide, so any running distro works. Blocking: call off the UI thread.
+pub fn reclaim_cache(distros: &[String]) -> bool {
+    read_order(distros).into_iter().any(|d| {
+        wsl(&[
+            "-d",
+            d,
+            "-u",
+            "root",
+            "-e",
+            "sh",
+            "-c",
+            "sync; echo 3 > /proc/sys/vm/drop_caches",
+        ])
+        .is_some()
+    })
+}
+
+/// `wsl --shutdown`. Blocking: call off the UI thread.
+pub fn shutdown() -> bool {
+    wsl(&["--shutdown"]).is_some()
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Reclaim {
+    /// No %USERPROFILE%\.wslconfig.
+    NoConfig,
+    NotSet,
+    Gradual,
+    DropCache,
+    Disabled,
+    Unknown,
+}
+
+impl Reclaim {
+    pub fn label(self) -> &'static str {
+        match self {
+            Reclaim::NoConfig => "not set (no .wslconfig)",
+            Reclaim::NotSet => "not set",
+            Reclaim::Gradual => "gradual",
+            Reclaim::DropCache => "dropcache",
+            Reclaim::Disabled => "disabled",
+            Reclaim::Unknown => "unrecognised value",
+        }
+    }
+}
+
+/// `autoMemoryReclaim` from %USERPROFILE%\.wslconfig ([experimental], also
+/// accepted under [wsl2]).
+pub fn auto_memory_reclaim() -> Reclaim {
+    let Some(home) = std::env::var_os("USERPROFILE") else {
+        return Reclaim::NoConfig;
+    };
+    let Ok(text) = std::fs::read_to_string(std::path::Path::new(&home).join(".wslconfig")) else {
+        return Reclaim::NoConfig;
+    };
+    parse_reclaim(&text)
+}
+
+fn parse_reclaim(text: &str) -> Reclaim {
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.split(['#', ';']).next().unwrap_or("").trim();
+        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = s.trim().to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("autoMemoryReclaim")
+            && (section == "experimental" || section == "wsl2")
+        {
+            return match value.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+                "gradual" => Reclaim::Gradual,
+                "dropcache" => Reclaim::DropCache,
+                "disabled" => Reclaim::Disabled,
+                _ => Reclaim::Unknown,
+            };
+        }
+    }
+    Reclaim::NotSet
+}
