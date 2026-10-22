@@ -17,7 +17,7 @@ taskbar RAM monitor, taskbar system stats.*
 
 Hover it for the full breakdown:
 
-![Hover panel](docs/img/panel.png)
+![Hover panel](docs/img/hover-panel.png)
 
 - **Small.** One ~0.5 MB portable `.exe`, ~3.5 MB of RAM (measured), about 0% CPU at
   idle. Plain Win32 + Direct2D, no GUI framework, no runtime, no service.
