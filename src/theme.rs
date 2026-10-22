@@ -1,0 +1,57 @@
+use crate::util::reg_dword;
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
+use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+
+/// The taskbar follows the system theme, not the app theme.
+pub fn system_light() -> bool {
+    reg_dword(
+        HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        "SystemUsesLightTheme",
+    ) == Some(1)
+}
+
+pub struct Palette {
+    pub label: D2D1_COLOR_F,
+    pub value: D2D1_COLOR_F,
+    pub warn: D2D1_COLOR_F,
+    pub crit: D2D1_COLOR_F,
+}
+
+const fn rgb(hex: u32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: ((hex >> 16) & 0xff) as f32 / 255.0,
+        g: ((hex >> 8) & 0xff) as f32 / 255.0,
+        b: (hex & 0xff) as f32 / 255.0,
+        a: 1.0,
+    }
+}
+
+pub fn palette(light: bool) -> Palette {
+    if light {
+        Palette {
+            label: rgb(0x5f5f5f),
+            value: rgb(0x1a1a1a),
+            warn: rgb(0x9d5d00),
+            crit: rgb(0xc42b1c),
+        }
+    } else {
+        Palette {
+            label: rgb(0xa8a8a8),
+            value: rgb(0xf3f3f3),
+            warn: rgb(0xfce100),
+            crit: rgb(0xff99a4),
+        }
+    }
+}
+
+/// Normal below 80 %, yellow from 80 %, red from 90 %.
+pub fn level(p: &Palette, fraction: f64) -> D2D1_COLOR_F {
+    if fraction >= 0.9 {
+        p.crit
+    } else if fraction >= 0.8 {
+        p.warn
+    } else {
+        p.value
+    }
+}
