@@ -88,14 +88,21 @@ pub fn running_distros() -> Vec<String> {
         .collect()
 }
 
-/// The distro to read from: any running one works, since all distros share the
-/// VM's kernel. Docker Desktop's internal distros are avoided when possible.
-pub fn pick(distros: &[String]) -> Option<&str> {
-    distros
-        .iter()
-        .find(|d| !d.starts_with("docker-desktop"))
-        .or(distros.first())
-        .map(|s| s.as_str())
+/// Distros to read meminfo through, best first. Any running one works, since all
+/// distros share the VM's kernel. Docker Desktop's distro comes first: it runs for
+/// as long as Docker Desktop does, so reading through it never keeps one of your
+/// own distros from stopping when idle.
+pub fn read_order(distros: &[String]) -> Vec<&str> {
+    let mut v: Vec<&str> = distros.iter().map(|s| s.as_str()).collect();
+    v.sort_by_key(|d| *d != "docker-desktop");
+    v
+}
+
+/// meminfo through the first distro in `read_order` that answers.
+pub fn meminfo_any(distros: &[String]) -> Option<(String, LinuxMem)> {
+    read_order(distros)
+        .into_iter()
+        .find_map(|d| meminfo(d).map(|m| (d.to_string(), m)))
 }
 
 /// /proc/meminfo of the WSL VM, read through an already running distro.

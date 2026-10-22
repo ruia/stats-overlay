@@ -58,10 +58,14 @@ pub fn spawn(notify: HWND) {
             } else if wsl_checked.is_none_or(|t| t.elapsed() >= WSL_INTERVAL) {
                 wsl_checked = Some(Instant::now());
                 let distros = wsl::running_distros();
-                match wsl::pick(&distros) {
-                    Some(d) => (wsl_state, linux) = (WslState::Running, wsl::meminfo(d).or(linux)),
-                    None => (wsl_state, linux) = (WslState::NoDistro, None),
-                }
+                (wsl_state, linux) = if distros.is_empty() {
+                    (WslState::NoDistro, None)
+                } else {
+                    (
+                        WslState::Running,
+                        wsl::meminfo_any(&distros).map(|(_, m)| m).or(linux),
+                    )
+                };
             } else if wsl_state == WslState::Off {
                 wsl_state = WslState::NoDistro;
             }
