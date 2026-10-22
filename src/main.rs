@@ -61,6 +61,7 @@ const ID_SHUTDOWN: usize = 4;
 const ID_STARTUP: usize = 5;
 const ID_WSLCONFIG_OPEN: usize = 6;
 const ID_MEMORY_CUSTOM: usize = 7;
+const ID_WSL_SETTINGS_APP: usize = 8;
 /// + index into Layout::ALL.
 const ID_LAYOUT: usize = 100;
 /// + index into Toggle::ALL.
@@ -233,6 +234,21 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 startup::set(!startup::enabled());
             }
             ID_WSLCONFIG_OPEN => open_wslconfig(),
+            ID_WSL_SETTINGS_APP => {
+                if let Some(exe) = wslconfig::settings_app() {
+                    let e = wide(&exe.to_string_lossy());
+                    unsafe {
+                        ShellExecuteW(
+                            None,
+                            w!("open"),
+                            util::pcwstr(&e),
+                            None,
+                            None,
+                            SW_SHOWNORMAL,
+                        );
+                    }
+                }
+            }
             ID_MEMORY_CUSTOM => {
                 let total = latest().map_or(0, |s| s.total);
                 let max = ((total as f64 / GIB).round() as u32).max(1);
@@ -1095,6 +1111,9 @@ fn wsl_settings_menu() -> Option<HMENU> {
     menu_item(m, true, !standard, ID_MEMORY_CUSTOM, &custom);
     separator(m);
     menu_item(m, true, false, ID_WSLCONFIG_OPEN, "Open .wslconfig");
+    if wslconfig::settings_app().is_some() {
+        menu_item(m, true, false, ID_WSL_SETTINGS_APP, "Open WSL Settings app");
+    }
     menu_item(m, false, false, 0, "Changes apply after WSL restarts");
     Some(m)
 }

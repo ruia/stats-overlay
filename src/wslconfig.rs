@@ -58,6 +58,13 @@ pub fn path() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".wslconfig"))
 }
 
+/// The WSL Settings app that ships with WSL 2.3+ (Store/MSI WSL), if installed.
+pub fn settings_app() -> Option<PathBuf> {
+    let base = std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+    let exe = PathBuf::from(base).join(r"WSL\wslsettings\wslsettings.exe");
+    exe.is_file().then_some(exe)
+}
+
 pub fn read() -> WslConfig {
     match path().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(text) => WslConfig {

@@ -49,7 +49,7 @@ pub fn palette(light: bool) -> Palette {
             win: rgb(0x0a5bb5),
             wsl: rgb(0xa14a00),
             track: rgba(0x000000, 0.14),
-            panel: (rgba(0xf3f3f3, 0.98), rgb(0xd5d5d5)),
+            panel: (rgb(0xf3f3f3), rgb(0xd5d5d5)),
         }
     } else {
         Palette {
@@ -60,7 +60,7 @@ pub fn palette(light: bool) -> Palette {
             win: rgb(0x7fb8ff),
             wsl: rgb(0xffb070),
             track: rgba(0xffffff, 0.16),
-            panel: (rgba(0x2b2b2b, 0.98), rgb(0x474747)),
+            panel: (rgb(0x2b2b2b), rgb(0x474747)),
         }
     }
 }
