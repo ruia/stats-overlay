@@ -5,11 +5,13 @@ then start `target\release\statsoverlay.exe`.
 
 ## 1. Display options (right-click > Display)
 
-- Switch between **Grid**, **Windows / WSL rows** and **Compact**. The strip
+- Switch between **Grid**, **Windows / WSL rows**, **Bars** and **Compact**. The strip
   should change straight away and stay that way after Exit and restart.
 - Untick CPU, GPU, Commit charge and Disk one by one; each should disappear.
   In Compact they are greyed out (memory only).
-- Screenshot: the strip in each of the three layouts.
+- Bars: blue is Windows, orange is WSL. The RAM bar's two parts should match
+  WIN and WSL; the C: bar's orange part is the VHDX files.
+- Screenshot: the strip in each of the four layouts.
 
 ## 2. Disk
 
@@ -38,6 +40,9 @@ sections).
 - With WSL running it asks to restart WSL. Say No the first time (nothing should
   happen), Yes the second (the WSL part goes to "off"). After you open a distro
   again, the hover panel's WSL VM figure should stay under the limit.
+- **Memory limit > Custom…** opens a small box: type e.g. 20, OK, and check
+  `memory=20GB` in the file. A value you set elsewhere (e.g. `42701MB` from the
+  WSL Settings app) shows ticked as "Custom (41.7G)…".
 - Set **Memory limit > Default** to remove the line again.
 
 ## 4. Taskbar at the top (only if you use ExplorerPatcher / StartAllBack)

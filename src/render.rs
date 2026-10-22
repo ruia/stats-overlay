@@ -3,7 +3,8 @@
 //! The render target is forced to software: a D3D device would cost several MB of
 //! working set for a few hundred pixels of text.
 //!
-//! Content is a grid: columns of lines, each line a list of colored runs. The strip
+//! Content is a grid: columns of lines, each line a list of colored runs or a bar.
+//! The strip
 //! and the hover panel each own a Renderer.
 
 use windows::core::{w, Result};
@@ -37,6 +38,16 @@ pub struct Seg {
     pub text: String,
     pub color: D2D1_COLOR_F,
     pub bold: bool,
+    /// Set by `bar()`: the line is drawn as a bar instead of text.
+    pub bar: Option<Box<Bar>>,
+}
+
+/// A thin horizontal bar as wide as its column: filled parts on a track.
+#[derive(Clone)]
+pub struct Bar {
+    /// (fraction of the track, color), drawn left to right.
+    pub parts: Vec<(f32, D2D1_COLOR_F)>,
+    pub track: D2D1_COLOR_F,
 }
 
 pub fn seg(text: impl Into<String>, color: D2D1_COLOR_F, bold: bool) -> Seg {
@@ -44,7 +55,27 @@ pub fn seg(text: impl Into<String>, color: D2D1_COLOR_F, bold: bool) -> Seg {
         text: text.into(),
         color,
         bold,
+        bar: None,
     }
+}
+
+/// A line holding just a bar.
+pub fn bar(parts: Vec<(f32, D2D1_COLOR_F)>, track: D2D1_COLOR_F) -> Vec<Seg> {
+    vec![Seg {
+        text: String::new(),
+        color: track,
+        bold: false,
+        bar: Some(Box::new(Bar { parts, track })),
+    }]
+}
+
+/// Narrowest a bar gets, and its thickness.
+const BAR_MIN_DIP: f32 = 64.0;
+const BAR_H_DIP: f32 = 4.0;
+
+enum Line {
+    Text(IDWriteTextLayout),
+    Bar(Bar),
 }
 
 /// A column of lines.
@@ -73,7 +104,7 @@ pub struct Renderer {
     style: Style,
     scale: f32,
     widths: Vec<f32>,
-    columns: Vec<Vec<IDWriteTextLayout>>,
+    columns: Vec<Vec<Line>>,
     line_h: f32,
 }
 
@@ -164,12 +195,17 @@ impl Renderer {
             let mut layouts = Vec::new();
             let mut width = 0f32;
             for segs in col {
+                if let Some(b) = segs.first().and_then(|s| s.bar.as_deref()) {
+                    width = width.max(BAR_MIN_DIP * scale);
+                    layouts.push(Line::Bar(b.clone()));
+                    continue;
+                }
                 let layout = self.layout(segs, &fmt)?;
                 let mut m = DWRITE_TEXT_METRICS::default();
                 unsafe { layout.GetMetrics(&mut m)? };
                 width = width.max(m.widthIncludingTrailingWhitespace);
                 self.line_h = self.line_h.max(m.height);
-                layouts.push(layout);
+                layouts.push(Line::Text(layout));
             }
             self.widths[i] = if self.style.sticky_widths {
                 self.widths[i].max(width)
@@ -294,12 +330,15 @@ impl Renderer {
             let mut x = pad;
             for (col, width) in self.columns.iter().zip(&self.widths) {
                 for (i, l) in col.iter().enumerate() {
-                    let origin = Vector2 {
-                        X: x.round(),
-                        Y: top + self.line_h * i as f32,
-                    };
-                    self.rt
-                        .DrawTextLayout(origin, l, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    let y = top + self.line_h * i as f32;
+                    match l {
+                        Line::Text(l) => {
+                            let origin = Vector2 { X: x.round(), Y: y };
+                            self.rt
+                                .DrawTextLayout(origin, l, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        }
+                        Line::Bar(b) => self.draw_bar(b, x.round(), y, *width)?,
+                    }
                 }
                 x += width + gap;
             }
@@ -324,6 +363,43 @@ impl Renderer {
                 Some(&blend),
                 ULW_ALPHA,
             )?;
+        }
+        Ok(())
+    }
+}
+
+impl Renderer {
+    /// A bar centered in the line slot at `y`. Call between BeginDraw and EndDraw.
+    unsafe fn draw_bar(&self, b: &Bar, x: f32, y: f32, width: f32) -> Result<()> {
+        let h = (BAR_H_DIP * self.scale).round().max(2.0);
+        let top = (y + (self.line_h - h) / 2.0).round();
+        let rect = |l: f32, r: f32| D2D_RECT_F {
+            left: l,
+            top,
+            right: r,
+            bottom: top + h,
+        };
+        let track = D2D1_ROUNDED_RECT {
+            rect: rect(x, x + width),
+            radiusX: h / 2.0,
+            radiusY: h / 2.0,
+        };
+        self.rt
+            .FillRoundedRectangle(&track, &self.rt.CreateSolidColorBrush(&b.track, None)?);
+        let mut at = x;
+        for (frac, color) in &b.parts {
+            let w = (frac.clamp(0.0, 1.0) * width).min(x + width - at);
+            if w <= 0.0 {
+                break;
+            }
+            let part = D2D1_ROUNDED_RECT {
+                rect: rect(at, at + w),
+                radiusX: (h / 2.0).min(w / 2.0),
+                radiusY: h / 2.0,
+            };
+            self.rt
+                .FillRoundedRectangle(&part, &self.rt.CreateSolidColorBrush(color, None)?);
+            at += w;
         }
         Ok(())
     }

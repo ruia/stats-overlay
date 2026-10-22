@@ -20,6 +20,7 @@ mod diag;
 mod disk;
 mod metrics;
 mod procs;
+mod prompt;
 mod render;
 mod sampler;
 mod startup;
@@ -31,7 +32,7 @@ mod wslconfig;
 
 use config::{Config, Layout, Toggle};
 use disk::DiskSnap;
-use render::{seg, Column, Renderer, Seg, Style};
+use render::{bar, seg, Column, Renderer, Seg, Style};
 use sampler::{Snapshot, WslState, WM_APP_SAMPLE};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,7 @@ const ID_RECLAIM: usize = 3;
 const ID_SHUTDOWN: usize = 4;
 const ID_STARTUP: usize = 5;
 const ID_WSLCONFIG_OPEN: usize = 6;
+const ID_MEMORY_CUSTOM: usize = 7;
 /// + index into Layout::ALL.
 const ID_LAYOUT: usize = 100;
 /// + index into Toggle::ALL.
@@ -235,6 +237,19 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 startup::set(!startup::enabled());
             }
             ID_WSLCONFIG_OPEN => open_wslconfig(),
+            ID_MEMORY_CUSTOM => {
+                let total = latest().map_or(0, |s| s.total);
+                let max = ((total as f64 / GIB).round() as u32).max(1);
+                let current = wslconfig::read()
+                    .memory
+                    .map_or(max / 2, |b| (b as f64 / GIB).round() as u32);
+                unsafe {
+                    let _ = SetForegroundWindow(hwnd);
+                }
+                if let Some(gb) = prompt::memory_gb(hwnd, current, max) {
+                    wslconfig_changed(wslconfig::set_memory(Some(gb)));
+                }
+            }
             id @ ID_LAYOUT..ID_TOGGLE => {
                 if let Some(&l) = Layout::ALL.get(id - ID_LAYOUT) {
                     let mut c = app.config.get();
@@ -498,6 +513,8 @@ fn disk_snap() -> Option<DiskSnap> {
 ///            WSL 29.2G   CMT 94%          GPU  4%   VHD 86G ↓31G
 /// By owner:  WIN  20.8G ram   326G disk   8% cpu    CMT 94%
 ///            WSL  29.2G ram   86G ↓31G    4% cpu    GPU  4%
+/// Bars:      RAM 45.0/63.9G   C: 692/838G   CMT 92%   CPU 14%
+///            [win|wsl---]     [win|wsl--]   [####-]   GPU  0%
 /// Compact:   WIN 20.8G
 ///            WSL 29.2G
 /// ```
@@ -574,6 +591,66 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
                     v,
                 ]);
             }
+            cols
+        }
+        Layout::Bars => {
+            let f = |a: u64, b: u64| frac(a, b) as f32;
+            let mut cols = vec![vec![
+                vec![
+                    label("RAM "),
+                    seg(
+                        of(s.used, s.total),
+                        theme::level(p, frac(s.used, s.total)),
+                        true,
+                    ),
+                ],
+                bar(
+                    vec![
+                        (f(s.windows(), s.total), p.win),
+                        (f(s.vm_ram(), s.total), p.wsl),
+                    ],
+                    p.track,
+                ),
+            ]];
+            if let (Some(sys), Some(d)) = (system, d) {
+                let vhds: u64 = d
+                    .vhds
+                    .iter()
+                    .filter(|v| v.drive() == Some(sys.letter))
+                    .map(|v| v.on_disk)
+                    .sum();
+                cols.push(vec![
+                    vec![
+                        label(&format!("{}: ", sys.letter)),
+                        seg(
+                            of(sys.used(), sys.total),
+                            theme::level(p, frac(sys.used(), sys.total)),
+                            true,
+                        ),
+                    ],
+                    bar(
+                        vec![
+                            (f(d.windows_used(&sys), sys.total), p.win),
+                            (f(vhds, sys.total), p.wsl),
+                        ],
+                        p.track,
+                    ),
+                ]);
+            }
+            if let (true, Some((u, l))) = (c.commit, s.commit) {
+                cols.push(vec![
+                    vec![label("CMT "), commit()],
+                    bar(vec![(f(u, l), theme::level(p, frac(u, l)))], p.track),
+                ]);
+            }
+            let mut cg = Vec::new();
+            if c.cpu {
+                cg.push(vec![label("CPU "), percent(s.cpu)]);
+            }
+            if c.gpu {
+                cg.push(vec![label("GPU "), gpu()]);
+            }
+            cols.push(cg);
             cols
         }
         Layout::ByOwner => {
@@ -1015,11 +1092,11 @@ fn wsl_settings_menu() -> Option<HMENU> {
         };
         menu_item(m, true, gb == *choice, ID_MEMORY + i, &label);
     }
-    if !standard {
-        if let Some(b) = wc.memory {
-            menu_item(m, false, true, 0, &format!("    {} (custom)", gib(b)));
-        }
-    }
+    let custom = match (standard, wc.memory) {
+        (false, Some(b)) => format!("    Custom ({})…", gib(b)),
+        _ => "    Custom…".to_string(),
+    };
+    menu_item(m, true, !standard, ID_MEMORY_CUSTOM, &custom);
     separator(m);
     menu_item(m, true, false, ID_WSLCONFIG_OPEN, "Open .wslconfig");
     menu_item(m, false, false, 0, "Changes apply after WSL restarts");

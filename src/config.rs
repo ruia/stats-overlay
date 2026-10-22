@@ -13,17 +13,20 @@ pub enum Layout {
     Grid,
     /// One line for Windows and one for WSL, with ram, disk and cpu side by side.
     ByOwner,
+    /// One column per resource, text over a bar split Windows / WSL.
+    Bars,
     /// Just WIN and WSL memory.
     Compact,
 }
 
 impl Layout {
-    pub const ALL: [Layout; 3] = [Layout::Grid, Layout::ByOwner, Layout::Compact];
+    pub const ALL: [Layout; 4] = [Layout::Grid, Layout::ByOwner, Layout::Bars, Layout::Compact];
 
     pub fn label(self) -> &'static str {
         match self {
             Layout::Grid => "Grid (by metric)",
             Layout::ByOwner => "Windows / WSL rows",
+            Layout::Bars => "Bars (by resource)",
             Layout::Compact => "Compact (memory only)",
         }
     }
@@ -76,7 +79,8 @@ impl Config {
         Config {
             layout: match get("Layout") {
                 Some(1) => Layout::ByOwner,
-                Some(2) => Layout::Compact,
+                Some(2) => Layout::Bars,
+                Some(3) => Layout::Compact,
                 _ => Layout::Grid,
             },
             cpu: on(Toggle::Cpu),

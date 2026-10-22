@@ -5,13 +5,15 @@ and disk Windows and WSL2 are using. Single portable .exe, no runtime.
 
 Status: **v2** (disk, display options, WSL settings).
 
-Three layouts, picked from right-click > Display:
+Four layouts, picked from right-click > Display:
 
 ```
 Grid:      WIN 20.8G   ALL 50.0/63.9G   CPU 12%   C: 412/931G
            WSL 29.2G   CMT 94%          GPU  4%   VHD 86G ↓31G
 By owner:  WIN  20.8G ram   326G disk   8% cpu    CMT 94%
            WSL  29.2G ram   86G ↓31G    4% cpu    GPU  4%
+Bars:      RAM 45.0/63.9G   C: 692/838G   CMT 92%   CPU 14%
+           [win|wsl---]     [win|wsl--]   [####-]   GPU  0%
 Compact:   WIN 20.8G
            WSL 29.2G
 ```
@@ -27,7 +29,7 @@ disk is the drive's used space minus those files.
 
 **WSL settings.** Right-click > WSL settings edits `%USERPROFILE%\.wslconfig`:
 `autoMemoryReclaim` (gradual / dropCache / disabled / not set) and the VM memory
-limit (`[wsl2] memory`). Other lines and comments are kept; the original is
+limit (`[wsl2] memory`: default, presets, or Custom… for any whole number of GB). Other lines and comments are kept; the original is
 copied once to `.wslconfig.statsoverlay-backup`. Changes apply when WSL restarts,
 and it offers to restart it.
 
@@ -87,6 +89,7 @@ Display, Open Task Manager, Start with Windows (HKCU Run key), Exit. Only one in
 | `src/config.rs` | Display settings (layout, shown columns) in the registry |
 | `src/disk.rs` | Drives and WSL/Docker VHDX sizes |
 | `src/wslconfig.rs` | Reading and editing `.wslconfig` |
+| `src/prompt.rs` | The Custom… memory limit dialog (in-memory template) |
 | `src/procs.rs` | Per-process memory via NtQuerySystemInformation (what Task Manager uses) |
 | `src/wsl.rs` | wsl.exe calls, only while the VM and a distro are already running |
 | `src/render.rs` | Direct2D/DirectWrite into a premultiplied DIB, UpdateLayeredWindow |
