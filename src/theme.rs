@@ -75,3 +75,34 @@ pub fn level(p: &Palette, fraction: f64) -> D2D1_COLOR_F {
         p.value
     }
 }
+
+/// Makes this process's popup menus dark or light to match the taskbar. Win32
+/// menus have no documented dark mode; this uses uxtheme's undocumented
+/// SetPreferredAppMode (ordinal 135), AllowDarkModeForWindow (133) and
+/// FlushMenuThemes (136), as Explorer, Notepad++ and others do. On Windows
+/// versions without them nothing happens and menus stay light.
+pub fn set_menu_dark(owner: windows::Win32::Foundation::HWND, dark: bool) {
+    use windows::core::{s, PCSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    type SetMode = unsafe extern "system" fn(i32) -> i32;
+    type AllowWindow = unsafe extern "system" fn(HWND, i32) -> i32;
+    type Flush = unsafe extern "system" fn();
+    type Proc = unsafe extern "system" fn() -> isize;
+    unsafe {
+        let Ok(ux) = LoadLibraryA(s!("uxtheme.dll")) else {
+            return;
+        };
+        let ordinal = |n: usize| GetProcAddress(ux, PCSTR(n as *const u8));
+        // ForceDark / ForceLight.
+        if let Some(f) = ordinal(135) {
+            std::mem::transmute::<Proc, SetMode>(f)(if dark { 2 } else { 3 });
+        }
+        if let Some(f) = ordinal(133) {
+            std::mem::transmute::<Proc, AllowWindow>(f)(owner, dark as i32);
+        }
+        if let Some(f) = ordinal(136) {
+            std::mem::transmute::<Proc, Flush>(f)();
+        }
+    }
+}

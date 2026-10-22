@@ -1981,6 +1981,8 @@ fn show_menu() {
     let busy = ACTION_BUSY.load(Ordering::Acquire);
     let running = snap.is_some_and(|s| s.wsl_state == WslState::Running);
     let vm_up = snap.is_some_and(|s| s.vm.is_some());
+    // Dark menus in a dark taskbar, light in a light one.
+    theme::set_menu_dark(host, !app().light.get());
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         menu_item(
