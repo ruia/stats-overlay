@@ -13,19 +13,24 @@ fn main() {
     }
     if target_env == "msvc" {
         println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", dir.join("app.manifest").display());
+        println!(
+            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+            dir.join("app.manifest").display()
+        );
         return;
     }
     // GNU: layered child windows need the manifest's Windows 8+ compatibility entry.
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("manifest.o");
-    let compiled = ["x86_64-w64-mingw32-windres", "windres"].iter().any(|windres| {
-        Command::new(windres)
-            .current_dir(&dir)
-            .args(["app.rc", "-O", "coff", "-o"])
-            .arg(&out)
-            .status()
-            .is_ok_and(|s| s.success())
-    });
+    let compiled = ["x86_64-w64-mingw32-windres", "windres"]
+        .iter()
+        .any(|windres| {
+            Command::new(windres)
+                .current_dir(&dir)
+                .args(["app.rc", "-O", "coff", "-o"])
+                .arg(&out)
+                .status()
+                .is_ok_and(|s| s.success())
+        });
     if compiled {
         println!("cargo:rustc-link-arg-bins={}", out.display());
     } else {

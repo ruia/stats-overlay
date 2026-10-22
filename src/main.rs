@@ -1014,6 +1014,26 @@ fn panel_anchor() -> Option<RECT> {
     Some(r)
 }
 
+/// The overflow flyout's rectangle when `icon` is in it rather than on the taskbar.
+fn overflow_flyout(icon: &RECT, taskbar: &RECT) -> Option<RECT> {
+    let on_taskbar = icon.top >= taskbar.top && icon.bottom <= taskbar.bottom;
+    if on_taskbar {
+        return None;
+    }
+    let center = POINT {
+        x: (icon.left + icon.right) / 2,
+        y: (icon.top + icon.bottom) / 2,
+    };
+    unsafe {
+        let h = WindowFromPoint(center);
+        let root = GetAncestor(h, GA_ROOT);
+        let mut r = RECT::default();
+        GetWindowRect(root, &mut r).ok()?;
+        // Not the flyout if it spans the screen (e.g. the point hit the desktop).
+        (r.right - r.left < (taskbar.right - taskbar.left) / 2).then_some(r)
+    }
+}
+
 fn update_panel() {
     let app = app();
     let (Some(snap), Some(sr), Some(tb)) = (latest(), panel_anchor(), taskbar::find()) else {
@@ -1067,14 +1087,25 @@ fn update_panel() {
         return;
     };
     let tbr = taskbar::rect(tb);
-    let x = sr.left.clamp(tbr.left, (tbr.right - w).max(tbr.left));
     let gap = (6.0 * scale) as i32;
+    let at_top = taskbar::at_top(tb);
+    let mut x = sr.left.clamp(tbr.left, (tbr.right - w).max(tbr.left));
     // Above the taskbar, or below it when the taskbar is at the top of its screen.
-    let y = if taskbar::at_top(tb) {
+    let mut y = if at_top {
         tbr.bottom + gap
     } else {
         tbr.top - h - gap
     };
+    // An icon in the ^ overflow flyout sits outside the taskbar: put the panel
+    // beside the flyout so it never covers the icons you're pointing at.
+    if let Some(f) = overflow_flyout(&sr, &tbr) {
+        x = if f.left - gap - w >= tbr.left {
+            f.left - gap - w
+        } else {
+            f.right + gap
+        };
+        y = if at_top { f.top } else { f.bottom - h };
+    }
     unsafe {
         let _ = SetWindowPos(
             panel,

@@ -60,12 +60,14 @@ fn wsl(args: &[&str]) -> Option<Vec<u8>> {
 /// wsl.exe's own messages are UTF-16LE unless WSL_UTF8 took effect.
 fn decode(bytes: &[u8]) -> String {
     let utf16 = bytes.len() >= 2
-        && bytes.chunks_exact(2).remainder().is_empty()
+        && bytes.len() & 1 == 0
         && bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count() * 2 > bytes.len() / 2;
     if utf16 {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .iter()
+            .step_by(2)
+            .zip(bytes.iter().skip(1).step_by(2))
+            .map(|(&lo, &hi)| u16::from_le_bytes([lo, hi]))
             .collect();
         String::from_utf16_lossy(&units)
     } else {
