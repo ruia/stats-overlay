@@ -1,9 +1,9 @@
 //! Display settings, kept as DWORDs under HKCU\Software\StatsOverlay and changed
 //! from the right-click menu.
 
-use crate::util::{pcwstr, reg_dword, wide};
+use crate::util::{pcwstr, reg_dword, reg_string, wide};
 use std::ffi::c_void;
-use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD};
+use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, REG_SZ};
 
 const KEY: &str = r"Software\StatsOverlay";
 
@@ -176,6 +176,8 @@ pub struct Config {
     pub style: PanelStyle,
     pub panel: Items,
     pub tray_second: TraySecond,
+    /// Device batteries (when built with the `batteries` feature); off by default.
+    pub batteries: bool,
 }
 
 /// The items that can be toggled, in menu order.
@@ -215,6 +217,7 @@ impl Config {
             style: PanelStyle::ALL[pick("PanelStyle", PanelStyle::ALL.len())],
             panel: Items::from_bits(get("PanelItems").unwrap_or(0xf)),
             tray_second: TraySecond::ALL[pick("TraySecond", TraySecond::ALL.len())],
+            batteries: get("Batteries") == Some(1),
         }
     }
 
@@ -238,6 +241,12 @@ impl Config {
         save("TraySecond", index(&TraySecond::ALL, &t));
     }
 
+    #[cfg_attr(not(feature = "batteries"), allow(dead_code))]
+    pub fn set_batteries(&mut self, on: bool) {
+        self.batteries = on;
+        save("Batteries", on as u32);
+    }
+
     pub fn flip_strip(&mut self, t: Toggle) {
         self.strip.flip(t);
         save("StripItems", self.strip.bits());
@@ -246,6 +255,31 @@ impl Config {
     pub fn flip_panel(&mut self, t: Toggle) {
         self.panel.flip(t);
         save("PanelItems", self.panel.bits());
+    }
+}
+
+/// Keys (battery::Battery::key) of the devices unticked under Display > Device
+/// batteries. New devices show by default.
+pub fn hidden_batteries() -> Vec<String> {
+    reg_string(HKEY_CURRENT_USER, KEY, "HiddenBatteries")
+        .unwrap_or_default()
+        .split('|')
+        .filter(|k| !k.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+pub fn set_hidden_batteries(keys: &[String]) {
+    let (k, n, v) = (wide(KEY), wide("HiddenBatteries"), wide(&keys.join("|")));
+    unsafe {
+        let _ = RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            pcwstr(&k),
+            pcwstr(&n),
+            REG_SZ.0,
+            Some(v.as_ptr() as *const c_void),
+            (v.len() * 2) as u32,
+        );
     }
 }
 

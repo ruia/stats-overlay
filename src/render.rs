@@ -7,7 +7,8 @@
 //! The strip
 //! and the hover panel each own a Renderer.
 
-use windows::core::{w, Result};
+use crate::util::wide;
+use windows::core::{w, Result, BOOL, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
@@ -44,6 +45,8 @@ pub struct Seg {
     /// Set by `bar()` / `spark()`: the line is drawn as a graphic instead of text.
     pub bar: Option<Box<Bar>>,
     pub spark: Option<Box<Spark>>,
+    /// Drawn in the icon font (Segoe Fluent Icons, or MDL2 Assets on Windows 10).
+    pub icon: bool,
 }
 
 /// A small history graph: one column per sample, series stacked bottom-up,
@@ -70,6 +73,16 @@ pub fn seg(text: impl Into<String>, color: D2D1_COLOR_F, bold: bool) -> Seg {
         size: 1.0,
         bar: None,
         spark: None,
+        icon: false,
+    }
+}
+
+/// A glyph from the icon font, e.g. `'\u{E702}'` (Bluetooth).
+#[cfg_attr(not(feature = "batteries"), allow(dead_code))]
+pub fn icon(glyph: char, color: D2D1_COLOR_F) -> Seg {
+    Seg {
+        icon: true,
+        ..seg(glyph, color, false)
     }
 }
 
@@ -98,6 +111,7 @@ pub fn bar(parts: Vec<(f32, D2D1_COLOR_F)>, track: D2D1_COLOR_F) -> Vec<Seg> {
         size: 1.0,
         bar: Some(Box::new(Bar { parts, track })),
         spark: None,
+        icon: false,
     }]
 }
 
@@ -146,6 +160,8 @@ pub struct Renderer {
     line_h: f32,
     /// Height of each row (the tallest line at that index across columns).
     rows: Vec<f32>,
+    /// Family name for icon runs, NUL-terminated.
+    icon_font: Vec<u16>,
 }
 
 impl Renderer {
@@ -168,6 +184,7 @@ impl Renderer {
             // Grayscale: ClearType needs an opaque background.
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let dc = CreateCompatibleDC(None);
+            let icon_font = wide(icon_family(&dwrite));
             Ok(Renderer {
                 dwrite,
                 rt,
@@ -182,6 +199,7 @@ impl Renderer {
                 columns: Vec::new(),
                 line_h: 0.0,
                 rows: Vec::new(),
+                icon_font,
             })
         }
     }
@@ -296,6 +314,9 @@ impl Renderer {
                 }
                 if s.size != 1.0 {
                     layout.SetFontSize(fmt.GetFontSize() * s.size, range)?;
+                }
+                if s.icon {
+                    layout.SetFontFamilyName(PCWSTR(self.icon_font.as_ptr()), range)?;
                 }
             }
             start += len;
@@ -528,6 +549,27 @@ impl Renderer {
             at += w;
         }
         Ok(())
+    }
+}
+
+/// Segoe Fluent Icons (Windows 11), else Segoe MDL2 Assets (Windows 10); the
+/// glyphs used here have the same code points in both.
+fn icon_family(dwrite: &IDWriteFactory) -> &'static str {
+    const FLUENT: &str = "Segoe Fluent Icons";
+    let mut fonts = None;
+    let (mut index, mut exists) = (0u32, BOOL(0));
+    let w = wide(FLUENT);
+    unsafe {
+        if dwrite.GetSystemFontCollection(&mut fonts, false).is_ok() {
+            if let Some(f) = fonts {
+                let _ = f.FindFamilyName(PCWSTR(w.as_ptr()), &mut index, &mut exists);
+            }
+        }
+    }
+    if exists.as_bool() {
+        FLUENT
+    } else {
+        "Segoe MDL2 Assets"
     }
 }
 

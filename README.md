@@ -43,6 +43,25 @@ Hover it for the full breakdown:
 
 Values turn yellow at 80% and red at 90%.
 
+### Device batteries (optional)
+
+Right-click > Display > Device batteries > **Show device batteries** adds the
+battery level of wireless mice, keyboards and headsets to the strip and the
+hover panel: name, %, a bolt while charging or plugged in, and how it's connected
+(a receiver dongle or the Bluetooth logo). It's off by default; while off, nothing
+is polled and no device is opened.
+
+- **Logitech** devices on a Unifying, Bolt or Lightspeed receiver, on Bluetooth or
+  on a cable, read over HID++ 2.0 (`UNIFIED_BATTERY`, else `BATTERY_STATUS`)
+  once a minute. A device that's asleep keeps its last reading, dimmed. It works
+  next to G HUB and Logi Options+.
+- **Any Bluetooth device** Windows shows a battery level for in Settings >
+  Bluetooth & devices (earbuds, headsets, controllers): the level only, no
+  charging state, and only while it's connected.
+
+Each device found gets a tick in the same submenu, to hide it. Yellow from 20%
+down, red from 10%. Builds made with `--no-default-features` leave all of this out.
+
 ### Why the WSL figure is bigger than Task Manager's VmmemWSL
 
 Windows compresses the VM's idle memory and moves it into the *Memory
@@ -108,7 +127,8 @@ Build Tools (C++ workload):
 cargo build --release
 ```
 
-Output: `target\release\statsoverlay.exe`. Cross-compiling with
+Output: `target\release\statsoverlay.exe`. `--no-default-features` builds it without
+the device batteries code (about 35 KB smaller). Cross-compiling with
 `--target x86_64-pc-windows-gnu` also works (needs MinGW's `windres`).
 
 ### Releasing
@@ -178,6 +198,7 @@ Windows vs. WSL split: compressed VM memory, commit, and virtual disk space.
 | `src/taskbar.rs` | Finding the taskbar, alignment, Widgets button, top/bottom |
 | `src/theme.rs` | Light/dark, colors |
 | `src/tray.rs` | Tray-icon mode: icon drawing, tooltip, anchor for the panel |
+| `src/battery/` | Device batteries (feature `batteries`): polling thread, Logitech HID++ (`hidpp.rs`), Bluetooth battery property (`bluetooth.rs`) |
 | `src/startup.rs` | Start with Windows (HKCU Run key) |
 | `src/diag.rs` | `--diag` report |
 | `build.rs`, `app.manifest`, `app.rc` | Embeds the manifest (DPI awareness, Windows 10/11 compatibility) |
