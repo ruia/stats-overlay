@@ -2225,6 +2225,9 @@ fn show_menu() {
     theme::set_menu_dark(host, !app().light.get());
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
+        let title = concat!("StatsOverlay v", env!("CARGO_PKG_VERSION"));
+        menu_item(menu, false, false, 0, title);
+        separator(menu);
         menu_item(
             menu,
             running && !busy,
