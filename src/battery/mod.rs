@@ -117,6 +117,14 @@ fn run(notify: HWND) {
         let full = polls.is_multiple_of(RESCAN_EVERY) || RESCAN.swap(false, Ordering::Relaxed);
         polls = polls.wrapping_add(1);
         let mut list = logitech.poll(full);
+        // A mouse moved from its receiver to Bluetooth (or a cable) answers on
+        // the new link; drop the old link's stale entry rather than list it twice.
+        let live: Vec<String> = list
+            .iter()
+            .filter(|b| !b.stale)
+            .map(|b| b.name.clone())
+            .collect();
+        list.retain(|b| !b.stale || !live.iter().any(|n| same_name(n, &b.name)));
         let read = list.clone();
         // A Logitech device on Bluetooth also has Windows' property: keep the
         // HID++ entry, which knows about charging.

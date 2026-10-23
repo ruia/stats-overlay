@@ -673,10 +673,10 @@ fn disk_snap() -> Option<DiskSnap> {
     sampler::DISK.lock().unwrap().clone()
 }
 
-/// Icon-font glyphs (Segoe Fluent Icons / MDL2 Assets).
+/// Icon-font glyphs (Segoe Fluent Icons / MDL2 Assets). The charging bolt is
+/// drawn instead (render::bolt): the font's is an outline, too heavy at this size.
 #[cfg(feature = "batteries")]
 mod glyph {
-    pub const BOLT: char = '\u{E945}';
     pub const BLUETOOTH: char = '\u{E702}';
     /// A USB dongle: Unifying, Bolt or Lightspeed receiver.
     pub const RECEIVER: char = '\u{E88E}';
@@ -720,8 +720,7 @@ fn battery_rows(p: &Palette, short: bool) -> Vec<(Seg, Vec<Seg>)> {
             };
             let mut v = vec![seg(format!("{}%", b.percent), color, true)];
             if b.plugged() {
-                v.push(seg(" ", p.label, false));
-                v.push(render::icon(glyph::BOLT, p.value));
+                v.push(render::bolt(p.ok));
             }
             if let Some(g) = match b.link {
                 Link::Receiver => Some(glyph::RECEIVER),
@@ -734,7 +733,8 @@ fn battery_rows(p: &Palette, short: bool) -> Vec<(Seg, Vec<Seg>)> {
             if !short {
                 let state = match (b.stale, b.charging) {
                     (true, _) => "asleep · last reading",
-                    (_, Some(ChargeState::Charging)) => "charging",
+                    // Charging is the bolt alone.
+                    (_, Some(ChargeState::Charging)) => "",
                     (_, Some(ChargeState::Full)) => "charged",
                     (_, Some(ChargeState::Error)) => "charging error",
                     _ if b.external => "plugged in",

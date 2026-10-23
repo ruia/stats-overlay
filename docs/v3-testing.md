@@ -25,9 +25,10 @@ then start `target\release\statsoverlay.exe`.
 
 ## 3. Charging and sleep
 
-- Plug a Logitech mouse or keyboard into its cable: within a minute a bolt
-  appears after the %, and the panel says "charging" (or "charged" when full,
-  "plugged in" when it's on power but not charging).
+- Plug a Logitech mouse or keyboard into its cable: within a minute a slim green bolt
+  appears after the %, about as tall as the connection glyph. The panel adds
+  "charged" when full and "plugged in" when on power but not charging; while
+  charging the bolt alone says so.
 - Leave a keyboard alone until it sleeps: its % turns grey and the panel says
   "asleep · last reading". Press a key: within a minute it's live again.
 - Below 20 % the number turns yellow, below 10 % red; at 15 % or less (not
@@ -57,6 +58,27 @@ nothing else changes.
 | | exe | private working set, idle |
 | --- | --- | --- |
 | main (before) | 528,384 B | 3.90 MB |
-| this branch, `--no-default-features` | 534,016 B | – |
-| this branch, feature off | 568,832 B | 3.86 MB |
-| this branch, feature on (2 devices) | 568,832 B | 4.25 MB |
+| this branch, `--no-default-features` | 537,088 B | – |
+| this branch, feature off | 572,928 B | 3.86 MB |
+| this branch, feature on (2 devices) | 572,928 B | 4.25 MB |
+
+(Memory measured on the first build of the branch; the bolt drawing added
+about 4 KB to the exe since.)
+
+## Results on the dev PC (Oct 2026)
+
+G HUB and Logi Options+ running throughout; neither interfered, and G HUB
+kept recording its own battery readings.
+
+| Device | Link | Read via | Shown |
+| --- | --- | --- | --- |
+| MX Master 3S | Bolt receiver (C548), index 1 | HID++ 0x1004 at feature index 0x08 | 20%, then 20% + bolt on the cable (`14 02 01 01`) |
+| G515 LS TKL | Lightspeed receiver (C547), index 1 | HID++ 0x1004 at 0x08 | 86%; greyed "asleep · last reading" when it slept; 85% + bolt on the cable (`55 08 01 01`). On the cable it stays on the receiver, no second entry |
+| MX Master 3S | Bluetooth LE (B034), index 0xFF on the FF43 long collection | HID++ 0x1004 at 0x08 | 25%, then 30% + bolt, Bluetooth glyph; listed once |
+| Nothing Ear (2) | Bluetooth | Windows' battery property (on its hands-free node; "connected" read from the device node) | 90%, Bluetooth glyph, no bolt |
+
+- Show device batteries off → on → off: the polling thread exits and comes
+  back, the column goes and returns, the setting is saved.
+- Unticking a device hides it from the strip and the panel and is saved
+  (`HiddenBatteries`); ticking it brings it back.
+- Strip, and all five panel styles, checked in the dark theme.

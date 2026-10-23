@@ -70,6 +70,8 @@ struct Known {
     /// (feature id, its index on this device); None: no battery feature we read.
     battery: Option<(u16, u8)>,
     last: Option<Battery>,
+    /// Look the name and features up again at the next answer.
+    recheck: bool,
 }
 
 #[derive(Default)]
@@ -134,6 +136,14 @@ impl Hidpp {
             return;
         }
         let pos = match pos {
+            Some(i) if self.known[i].recheck => {
+                let last = self.known[i].last.take();
+                self.known[i] = Known {
+                    last,
+                    ..identify(io, port, index)
+                };
+                i
+            }
             Some(i) => i,
             None => {
                 self.known.push(identify(io, port, index));
@@ -150,8 +160,12 @@ impl Hidpp {
             if feature == UNIFIED_BATTERY { 1 } else { 0 },
             &[],
         ) else {
-            // Firmware updated or re-paired: look the features up again next time.
-            self.known.remove(pos);
+            // Firmware updated or re-paired: look the features up again next
+            // time it answers; show the last reading until then.
+            if let Some(last) = k.last.as_mut() {
+                last.stale = true;
+            }
+            k.recheck = true;
             return;
         };
         let (percent, charging, external) = if feature == UNIFIED_BATTERY {
@@ -195,6 +209,7 @@ fn identify(io: &mut Io, port: &Port, index: u8) -> Known {
         name,
         battery,
         last: None,
+        recheck: false,
     }
 }
 
