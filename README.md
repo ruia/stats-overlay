@@ -138,8 +138,8 @@ builds on every push and pull request; the exe is attached to each run. To
 publish a release, bump `version` in `Cargo.toml`, then tag and push:
 
 ```
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 `release.yml` builds it and creates the GitHub release with `statsoverlay.exe`
