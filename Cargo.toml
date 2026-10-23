@@ -1,6 +1,6 @@
 [package]
 name = "statsoverlay"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Tiny Windows 11 taskbar resource monitor (Windows vs WSL2)"
 build = "build.rs"
