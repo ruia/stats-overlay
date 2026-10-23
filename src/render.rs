@@ -7,10 +7,12 @@
 //! The strip
 //! and the hover panel each own a Renderer.
 
-use windows::core::{w, Result};
+use crate::util::wide;
+use windows::core::{w, Result, BOOL, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
+    D2D1_PIXEL_FORMAT, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -21,8 +23,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_METRICS,
-    DWRITE_TEXT_RANGE,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -44,6 +46,10 @@ pub struct Seg {
     /// Set by `bar()` / `spark()`: the line is drawn as a graphic instead of text.
     pub bar: Option<Box<Bar>>,
     pub spark: Option<Box<Spark>>,
+    /// Drawn in the icon font (Segoe Fluent Icons, or MDL2 Assets on Windows 10).
+    pub icon: bool,
+    /// A lightning bolt drawn with Direct2D in the space of this run's text.
+    pub bolt: bool,
 }
 
 /// A small history graph: one column per sample, series stacked bottom-up,
@@ -70,6 +76,27 @@ pub fn seg(text: impl Into<String>, color: D2D1_COLOR_F, bold: bool) -> Seg {
         size: 1.0,
         bar: None,
         spark: None,
+        icon: false,
+        bolt: false,
+    }
+}
+
+/// A glyph from the icon font, e.g. `'\u{E702}'` (Bluetooth).
+#[cfg_attr(not(feature = "batteries"), allow(dead_code))]
+pub fn icon(glyph: char, color: D2D1_COLOR_F) -> Seg {
+    Seg {
+        icon: true,
+        ..seg(glyph, color, false)
+    }
+}
+
+/// A slim filled lightning bolt, about as wide as a digit.
+#[cfg_attr(not(feature = "batteries"), allow(dead_code))]
+pub fn bolt(color: D2D1_COLOR_F) -> Seg {
+    Seg {
+        bolt: true,
+        // Two en spaces reserve the room; the bolt is drawn over them.
+        ..seg("\u{2002}\u{2002}", color, false)
     }
 }
 
@@ -98,6 +125,8 @@ pub fn bar(parts: Vec<(f32, D2D1_COLOR_F)>, track: D2D1_COLOR_F) -> Vec<Seg> {
         size: 1.0,
         bar: Some(Box::new(Bar { parts, track })),
         spark: None,
+        icon: false,
+        bolt: false,
     }]
 }
 
@@ -109,8 +138,8 @@ const SPARK_W_DIP: f32 = 140.0;
 const SPARK_LINES: f32 = 2.0;
 
 enum Line {
-    /// Layout and its height.
-    Text(IDWriteTextLayout, f32),
+    /// Layout, its height, and the bolts in it (text position, color).
+    Text(IDWriteTextLayout, f32, Vec<(u32, D2D1_COLOR_F)>),
     Bar(Bar),
     Spark(Spark),
 }
@@ -131,6 +160,7 @@ pub struct Style {
 }
 
 pub struct Renderer {
+    d2d: ID2D1Factory,
     dwrite: IDWriteFactory,
     rt: ID2D1DCRenderTarget,
     format: Option<(f32, IDWriteTextFormat)>,
@@ -146,6 +176,8 @@ pub struct Renderer {
     line_h: f32,
     /// Height of each row (the tallest line at that index across columns).
     rows: Vec<f32>,
+    /// Family name for icon runs, NUL-terminated.
+    icon_font: Vec<u16>,
 }
 
 impl Renderer {
@@ -168,7 +200,9 @@ impl Renderer {
             // Grayscale: ClearType needs an opaque background.
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let dc = CreateCompatibleDC(None);
+            let icon_font = wide(icon_family(&dwrite));
             Ok(Renderer {
+                d2d,
                 dwrite,
                 rt,
                 format: None,
@@ -182,6 +216,7 @@ impl Renderer {
                 columns: Vec::new(),
                 line_h: 0.0,
                 rows: Vec::new(),
+                icon_font,
             })
         }
     }
@@ -253,7 +288,15 @@ impl Renderer {
                     let mut m = DWRITE_TEXT_METRICS::default();
                     unsafe { layout.GetMetrics(&mut m)? };
                     let (w, h) = (m.widthIncludingTrailingWhitespace, m.height);
-                    (Line::Text(layout, h), w, h)
+                    let mut at = 0u32;
+                    let mut bolts = Vec::new();
+                    for s in segs {
+                        if s.bolt {
+                            bolts.push((at, s.color));
+                        }
+                        at += s.text.encode_utf16().count() as u32;
+                    }
+                    (Line::Text(layout, h, bolts), w, h)
                 };
                 width = width.max(w);
                 if self.rows.len() <= row {
@@ -296,6 +339,9 @@ impl Renderer {
                 }
                 if s.size != 1.0 {
                     layout.SetFontSize(fmt.GetFontSize() * s.size, range)?;
+                }
+                if s.icon {
+                    layout.SetFontFamilyName(PCWSTR(self.icon_font.as_ptr()), range)?;
                 }
             }
             start += len;
@@ -400,13 +446,16 @@ impl Renderer {
                     // Each line is centered vertically in its row.
                     let (y, rh) = (row_tops[i], self.rows[i]);
                     match l {
-                        Line::Text(l, lh) => {
+                        Line::Text(l, lh, bolts) => {
                             let origin = Vector2 {
                                 X: x.round(),
                                 Y: (y + (rh - lh) / 2.0).round(),
                             };
                             self.rt
                                 .DrawTextLayout(origin, l, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            for &(pos, color) in bolts {
+                                self.draw_bolt(l, pos, origin, color)?;
+                            }
                         }
                         Line::Bar(b) => {
                             let y = y + (rh - self.line_h) / 2.0;
@@ -495,6 +544,52 @@ impl Renderer {
         Ok(())
     }
 
+    /// A bolt over the two en spaces at text position `pos`: as tall as the icon
+    /// glyphs, centered in the spaces, sitting on the baseline.
+    unsafe fn draw_bolt(
+        &self,
+        layout: &IDWriteTextLayout,
+        pos: u32,
+        origin: Vector2,
+        color: D2D1_COLOR_F,
+    ) -> Result<()> {
+        let (mut px, mut py) = (0f32, 0f32);
+        let mut hit = DWRITE_HIT_TEST_METRICS::default();
+        layout.HitTestTextPosition(pos, false, &mut px, &mut py, &mut hit)?;
+        let size = self.style.font_dip * self.scale;
+        let h = size * 1.0;
+        let w = h * 0.5;
+        // The hit box is the first space; the run is two.
+        let left = origin.X + hit.left + hit.width - w / 2.0;
+        // Baseline of a normal-size line, from the top of its cell.
+        let bottom = origin.Y + hit.top + hit.height * 0.84;
+        let top = bottom - h;
+        // A slim zigzag: top right, down to the middle left, a notch, bottom.
+        let pts = [
+            (0.70, 0.00),
+            (0.12, 0.58),
+            (0.46, 0.58),
+            (0.30, 1.00),
+            (0.88, 0.40),
+            (0.54, 0.40),
+        ];
+        let geom = self.d2d.CreatePathGeometry()?;
+        let sink = geom.Open()?;
+        let p = |(fx, fy): (f32, f32)| Vector2 {
+            X: left + fx * w,
+            Y: top + fy * h,
+        };
+        sink.BeginFigure(p(pts[0]), D2D1_FIGURE_BEGIN_FILLED);
+        for &pt in &pts[1..] {
+            sink.AddLine(p(pt));
+        }
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink.Close()?;
+        self.rt
+            .FillGeometry(&geom, &self.rt.CreateSolidColorBrush(&color, None)?, None);
+        Ok(())
+    }
+
     /// A bar centered in the line slot at `y`. Call between BeginDraw and EndDraw.
     unsafe fn draw_bar(&self, b: &Bar, x: f32, y: f32, width: f32) -> Result<()> {
         let h = (BAR_H_DIP * self.scale).round().max(2.0);
@@ -528,6 +623,27 @@ impl Renderer {
             at += w;
         }
         Ok(())
+    }
+}
+
+/// Segoe Fluent Icons (Windows 11), else Segoe MDL2 Assets (Windows 10); the
+/// glyphs used here have the same code points in both.
+fn icon_family(dwrite: &IDWriteFactory) -> &'static str {
+    const FLUENT: &str = "Segoe Fluent Icons";
+    let mut fonts = None;
+    let (mut index, mut exists) = (0u32, BOOL(0));
+    let w = wide(FLUENT);
+    unsafe {
+        if dwrite.GetSystemFontCollection(&mut fonts, false).is_ok() {
+            if let Some(f) = fonts {
+                let _ = f.FindFamilyName(PCWSTR(w.as_ptr()), &mut index, &mut exists);
+            }
+        }
+    }
+    if exists.as_bool() {
+        FLUENT
+    } else {
+        "Segoe MDL2 Assets"
     }
 }
 

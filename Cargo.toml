@@ -5,6 +5,16 @@ edition = "2021"
 description = "Tiny Windows 11 taskbar resource monitor (Windows vs WSL2)"
 build = "build.rs"
 
+[features]
+default = ["batteries"]
+# Device batteries (Logitech HID++, Bluetooth). Off at runtime until enabled.
+batteries = [
+    "windows/Win32_Devices_DeviceAndDriverInstallation",
+    "windows/Win32_Devices_HumanInterfaceDevice",
+    "windows/Win32_Devices_Properties",
+    "windows/Win32_System_IO",
+]
+
 [dependencies]
 windows-numerics = "0.3"
 

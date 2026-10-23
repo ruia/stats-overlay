@@ -15,6 +15,8 @@
 
 #![windows_subsystem = "windows"]
 
+#[cfg(feature = "batteries")]
+mod battery;
 mod config;
 mod diag;
 mod disk;
@@ -65,6 +67,8 @@ const ID_WSLCONFIG_OPEN: usize = 6;
 const ID_MEMORY_CUSTOM: usize = 7;
 const ID_WSL_SETTINGS_APP: usize = 8;
 const ID_TRAY_PROMOTE: usize = 9;
+#[cfg(feature = "batteries")]
+const ID_BATTERIES: usize = 10;
 /// + index into Show::ALL.
 const ID_SHOW: usize = 90;
 const NIN_SELECT: u32 = WM_USER;
@@ -85,6 +89,8 @@ const ID_PANEL_TOGGLE: usize = 150;
 const ID_PANEL_STYLE: usize = 160;
 /// + index into TraySecond::ALL.
 const ID_TRAY_SECOND: usize = 170;
+/// + index into App::battery_menu.
+const ID_BATTERY_DEVICE: usize = 200;
 
 const RECLAIM_CHOICES: [(Reclaim, &str); 4] = [
     (Reclaim::NotSet, "Not set (WSL default)"),
@@ -121,6 +127,10 @@ struct App {
     hover_tray: Cell<bool>,
     strip: RefCell<Option<Renderer>>,
     panel_renderer: RefCell<Option<Renderer>>,
+    /// Device batteries unticked in the menu (config::hidden_batteries).
+    hidden_batteries: RefCell<Vec<String>>,
+    /// The device keys listed in the last menu, by ID_BATTERY_DEVICE offset.
+    battery_menu: RefCell<Vec<String>>,
 }
 
 thread_local! {
@@ -199,6 +209,8 @@ fn main() {
                 .ok(),
             ),
             panel_renderer: RefCell::new(None),
+            hidden_batteries: RefCell::new(config::hidden_batteries()),
+            battery_menu: RefCell::new(Vec::new()),
         }));
         APP.with(|a| a.set(app).ok());
 
@@ -222,6 +234,10 @@ fn main() {
         app.host.set(host);
         *app.tray.borrow_mut() = Some(tray::Tray::new(host));
         sampler::spawn(host);
+        #[cfg(feature = "batteries")]
+        if app.config.get().batteries {
+            battery::enable(true, host);
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -263,6 +279,9 @@ extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             _ => {}
         },
         WM_DESTROY => unsafe { PostQuitMessage(0) },
+        // A receiver or Bluetooth device came or went.
+        #[cfg(feature = "batteries")]
+        WM_DEVICECHANGE => battery::rescan(),
         m if m == app.msg_taskbar_created && m != 0 => {
             // Explorer restarted: the old taskbar (and our child) are gone or stale.
             hide_panel();
@@ -374,6 +393,33 @@ fn command(hwnd: HWND, id: usize) {
                 c.set_show(show);
                 set_config(c);
             }
+        }
+        #[cfg(feature = "batteries")]
+        ID_BATTERIES => {
+            let mut c = app.config.get();
+            c.set_batteries(!c.batteries);
+            battery::enable(c.batteries, app.host.get());
+            set_config(c);
+        }
+        id @ ID_BATTERY_DEVICE..300 => {
+            let Some(key) = app
+                .battery_menu
+                .borrow()
+                .get(id - ID_BATTERY_DEVICE)
+                .cloned()
+            else {
+                return;
+            };
+            let mut hidden = app.hidden_batteries.borrow_mut();
+            match hidden.iter().position(|k| *k == key) {
+                Some(i) => {
+                    hidden.remove(i);
+                }
+                None => hidden.push(key),
+            }
+            config::set_hidden_batteries(&hidden);
+            drop(hidden);
+            set_config(app.config.get());
         }
         ID_TRAY_PROMOTE => {
             let on = tray::promoted() != Some(true);
@@ -627,6 +673,100 @@ fn disk_snap() -> Option<DiskSnap> {
     sampler::DISK.lock().unwrap().clone()
 }
 
+/// Icon-font glyphs (Segoe Fluent Icons / MDL2 Assets). The charging bolt is
+/// drawn instead (render::bolt): the font's is an outline, too heavy at this size.
+#[cfg(feature = "batteries")]
+mod glyph {
+    pub const BLUETOOTH: char = '\u{E702}';
+    /// A USB dongle: Unifying, Bolt or Lightspeed receiver.
+    pub const RECEIVER: char = '\u{E88E}';
+}
+
+/// Device batteries to show: none unless enabled, and not the unticked ones.
+#[cfg(feature = "batteries")]
+fn batteries() -> Vec<battery::Battery> {
+    if !app().config.get().batteries {
+        return Vec::new();
+    }
+    let hidden = app().hidden_batteries.borrow();
+    battery::LATEST
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| !hidden.contains(&b.key))
+        .cloned()
+        .collect()
+}
+
+/// One row per device: its name, then "86%", a bolt while charging or plugged in,
+/// and the connection. `short` (the strip) uses the name's first word and drops
+/// the state text. A device that didn't answer shows its last % dimmed.
+#[cfg(feature = "batteries")]
+fn battery_rows(p: &Palette, short: bool) -> Vec<(Seg, Vec<Seg>)> {
+    use battery::{ChargeState, Link};
+    batteries()
+        .iter()
+        .map(|b| {
+            let name = if short {
+                seg(format!("{} ", b.short_name()), p.label, false)
+            } else {
+                seg(b.name.as_str(), p.label, false)
+            };
+            let color = if b.stale {
+                p.label
+            } else {
+                // Yellow from 20 % down, red from 10 %.
+                theme::level(p, 1.0 - b.percent as f64 / 100.0)
+            };
+            let mut v = vec![seg(format!("{}%", b.percent), color, true)];
+            if b.plugged() {
+                v.push(render::bolt(p.ok));
+            }
+            if let Some(g) = match b.link {
+                Link::Receiver => Some(glyph::RECEIVER),
+                Link::Bluetooth => Some(glyph::BLUETOOTH),
+                Link::Wired => None,
+            } {
+                v.push(seg(" ", p.label, false));
+                v.push(render::icon(g, p.label));
+            }
+            if !short {
+                let state = match (b.stale, b.charging) {
+                    (true, _) => "asleep · last reading",
+                    // Charging is the bolt alone.
+                    (_, Some(ChargeState::Charging)) => "",
+                    (_, Some(ChargeState::Full)) => "charged",
+                    (_, Some(ChargeState::Error)) => "charging error",
+                    _ if b.external => "plugged in",
+                    _ => "",
+                };
+                if !state.is_empty() {
+                    v.push(seg(format!("  {state}"), p.label, false));
+                }
+            }
+            (name, v)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "batteries"))]
+fn battery_rows(_: &Palette, _: bool) -> Vec<(Seg, Vec<Seg>)> {
+    Vec::new()
+}
+
+/// Batteries as single lines: "MX Master 3S  20% ⚡ ᛒ".
+fn battery_lines(p: &Palette, short: bool) -> Vec<Vec<Seg>> {
+    battery_rows(p, short)
+        .into_iter()
+        .map(|(mut name, v)| {
+            if !short {
+                name.text.push_str("  ");
+            }
+            std::iter::once(name).chain(v).collect()
+        })
+        .collect()
+}
+
 /// Lines of the strip, per layout. Hidden or unavailable metrics drop out, and so
 /// do columns left empty.
 ///
@@ -814,6 +954,10 @@ fn strip_columns(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
             cols
         }
     };
+    if c.layout != Layout::Compact {
+        // Two devices per column, like the other metrics.
+        cols.extend(battery_lines(p, true).chunks(2).map(<[_]>::to_vec));
+    }
     cols.retain(|c| !c.is_empty());
     cols
 }
@@ -992,6 +1136,14 @@ fn sections_panel(
             gpu.push(dim(format!("  VRAM {}", g(vram))));
         }
         row(l("GPU"), gpu);
+    }
+    let batteries = battery_rows(p, false);
+    if !batteries.is_empty() {
+        row(l(""), vec![]);
+        row(head("BATTERIES"), vec![]);
+        for (name, value) in batteries {
+            row(name, value);
+        }
     }
     if !embedded {
         row(
@@ -1179,6 +1331,12 @@ fn bars_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -> Ve
             .map_or(String::new(), |v| format!("   VRAM {}", g1(v)));
         meter("GPU", s.gpu.map(|x| x.percent), extra);
     }
+    let batteries = battery_lines(p, false);
+    if !batteries.is_empty() {
+        col.push(vec![]);
+        col.push(head("BATTERIES"));
+        col.extend(batteries);
+    }
     vec![col]
 }
 
@@ -1321,6 +1479,16 @@ fn tiles_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -> V
         col.push(vec![]);
         col.push(vec![seg(text, p.label, false)]);
     }
+    // One device per column, three to a row.
+    for (i, line) in battery_lines(p, false).into_iter().enumerate() {
+        if i % 3 == 0 {
+            // A blank line, then the row's three slots.
+            cols.iter_mut().for_each(|c| c.extend([vec![], vec![]]));
+        }
+        if let Some(last) = cols[i % 3].last_mut() {
+            *last = line;
+        }
+    }
     cols
 }
 
@@ -1434,6 +1602,14 @@ fn history_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) ->
             vec![l("changes slowly:\nno graph".into())],
         );
     }
+    let batteries = battery_lines(p, false);
+    if !batteries.is_empty() {
+        row(vec![], vec![]);
+        row(vec![seg("BATTERIES", p.label, true)], vec![]);
+        for line in batteries {
+            row(line, vec![]);
+        }
+    }
     vec![text, graph]
 }
 
@@ -1505,6 +1681,16 @@ fn insights_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -
             }
         }
     }
+    #[cfg(feature = "batteries")]
+    for b in batteries() {
+        if b.percent <= 15 && !b.plugged() && !b.stale {
+            items.push((
+                severity(1.0 - b.percent as f64 / 100.0),
+                format!("{} battery at {}%", b.name, b.percent),
+                "Charge it soon.".into(),
+            ));
+        }
+    }
     if s.vm.is_some() {
         let wc = s.wslconfig;
         if wc.memory.is_none() {
@@ -1547,6 +1733,17 @@ fn insights_panel(s: &Snapshot, d: Option<&DiskSnap>, c: &Config, p: &Palette) -
         summary.push(v(s.gpu.map_or("–".into(), |x| pct(x.percent))));
     }
     col.push(summary);
+    // Device batteries, side by side on one line.
+    let devices: Vec<Seg> = battery_lines(p, true)
+        .into_iter()
+        .flat_map(|mut line| {
+            line.push(seg("    ", p.label, false));
+            line
+        })
+        .collect();
+    if !devices.is_empty() {
+        col.push(devices);
+    }
     col.push(vec![]);
     if items.is_empty() {
         col.push(vec![
@@ -1934,6 +2131,49 @@ fn display_menu() -> Option<HMENU> {
         "Keep visible (not under ^)",
     );
     submenu(m, icon, "Tray icon");
+    #[cfg(feature = "batteries")]
+    if let Some(sub) = batteries_menu() {
+        separator(m);
+        submenu(m, sub, "Device batteries");
+    }
+    Some(m)
+}
+
+/// The on/off switch, then a tick per device found.
+#[cfg(feature = "batteries")]
+fn batteries_menu() -> Option<HMENU> {
+    let app = app();
+    let on = app.config.get().batteries;
+    let m = unsafe { CreatePopupMenu().ok()? };
+    menu_item(m, true, on, ID_BATTERIES, "Show device batteries");
+    if !on {
+        menu_item(m, false, false, 0, "Logitech (HID++) and Bluetooth devices");
+        return Some(m);
+    }
+    separator(m);
+    let devices = battery::LATEST.lock().unwrap().clone();
+    let hidden = app.hidden_batteries.borrow();
+    let mut keys = app.battery_menu.borrow_mut();
+    keys.clear();
+    if devices.is_empty() {
+        menu_item(m, false, false, 0, "No devices found yet");
+    }
+    for (i, b) in devices.iter().enumerate().take(100) {
+        let link = match b.link {
+            battery::Link::Receiver => "receiver",
+            battery::Link::Bluetooth => "Bluetooth",
+            battery::Link::Wired => "cable",
+        };
+        let text = format!("{} ({link}, {}%)", b.name, b.percent);
+        menu_item(
+            m,
+            true,
+            !hidden.contains(&b.key),
+            ID_BATTERY_DEVICE + i,
+            &text,
+        );
+        keys.push(b.key.clone());
+    }
     Some(m)
 }
 
