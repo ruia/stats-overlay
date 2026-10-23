@@ -2,19 +2,25 @@
 //! HID++, and any Bluetooth device Windows reports a battery level for.
 //!
 //! Off by default. While it's off no thread runs and no device is opened; turning
-//! it on from Display > Device batteries starts a thread that polls once a minute.
+//! it on from Display > Device batteries starts a thread that reads every device
+//! once a minute and, in between, picks up Logitech devices' battery and
+//! connection notifications as they're sent.
 
 mod bluetooth;
 mod hidpp;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-/// Batteries change slowly; HID++ devices answer in a few ms.
+/// A full read. Changes in between come as notifications (Logitech) or with a
+/// device change (Bluetooth).
 const INTERVAL: Duration = Duration::from_secs(60);
+const CONNECT_RETRY: Duration = Duration::from_secs(3);
 /// Every this many polls, look for new receivers, devices and pairings.
 const RESCAN_EVERY: u32 = 5;
 
@@ -73,77 +79,81 @@ pub static LATEST: Mutex<Vec<Battery>> = Mutex::new(Vec::new());
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static RESCAN: AtomicBool = AtomicBool::new(false);
-static THREAD: Mutex<Option<std::thread::Thread>> = Mutex::new(None);
+static RUNNING: Mutex<bool> = Mutex::new(false);
+/// Auto-reset event that wakes the thread: turned off, or a device change.
+static WAKE: OnceLock<isize> = OnceLock::new();
 
-/// Starts or stops polling. `notify` gets WM_APP_SAMPLE after each poll.
+fn wake_event() -> HANDLE {
+    HANDLE(*WAKE.get_or_init(|| unsafe {
+        CreateEventW(None, false, false, PCWSTR::null()).map_or(0, |h| h.0 as isize)
+    }) as _)
+}
+
+/// Starts or stops polling. `notify` gets WM_APP_SAMPLE after each change.
 pub fn enable(on: bool, notify: HWND) {
-    let mut thread = THREAD.lock().unwrap();
+    let mut running = RUNNING.lock().unwrap();
     ENABLED.store(on, Ordering::Relaxed);
-    match (&*thread, on) {
-        (Some(t), false) => t.unpark(),
-        (None, true) => {
-            let notify = notify.0 as usize;
-            *thread = std::thread::Builder::new()
-                .stack_size(128 * 1024)
-                .spawn(move || run(HWND(notify as _)))
-                .ok()
-                .map(|h| h.thread().clone());
+    if *running {
+        if !on {
+            unsafe {
+                let _ = SetEvent(wake_event());
+            }
         }
-        _ => {}
+    } else if on {
+        let notify = notify.0 as usize;
+        *running = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || run(HWND(notify as _)))
+            .is_ok();
     }
 }
 
 /// A device arrived or left (WM_DEVICECHANGE): look again now.
 pub fn rescan() {
-    if let Some(t) = THREAD.lock().unwrap().as_ref() {
+    if *RUNNING.lock().unwrap() {
         RESCAN.store(true, Ordering::Relaxed);
-        t.unpark();
+        unsafe {
+            let _ = SetEvent(wake_event());
+        }
     }
 }
 
 fn run(notify: HWND) {
+    let wake = wake_event();
     let mut logitech = hidpp::Hidpp::default();
     let mut polls = 0u32;
+    let mut next = INTERVAL;
     loop {
         {
             // Checked under the lock so a quick off-on can't leave no thread running.
-            let mut thread = THREAD.lock().unwrap();
+            let mut running = RUNNING.lock().unwrap();
             if !ENABLED.load(Ordering::Relaxed) {
-                *thread = None;
+                *running = false;
                 LATEST.lock().unwrap().clear();
                 break;
             }
         }
         let full = polls.is_multiple_of(RESCAN_EVERY) || RESCAN.swap(false, Ordering::Relaxed);
         polls = polls.wrapping_add(1);
-        let mut list = logitech.poll(full);
-        // A mouse moved from its receiver to Bluetooth (or a cable) answers on
-        // the new link; drop the old link's stale entry rather than list it twice.
-        let live: Vec<String> = list
-            .iter()
-            .filter(|b| !b.stale)
-            .map(|b| b.name.clone())
-            .collect();
-        list.retain(|b| !b.stale || !live.iter().any(|n| same_name(n, &b.name)));
-        let read = list.clone();
-        // A Logitech device on Bluetooth also has Windows' property: keep the
-        // HID++ entry, which knows about charging.
-        list.extend(bluetooth::read().into_iter().filter(|b| {
-            !read.iter().any(|l| {
-                l.address.is_some() && l.address == b.address
-                    || l.link == Link::Bluetooth && same_name(&l.name, &b.name)
-            })
-        }));
-        *LATEST.lock().unwrap() = list;
-        unsafe {
-            let _ = PostMessageW(
-                Some(notify),
-                crate::sampler::WM_APP_SAMPLE,
-                WPARAM(0),
-                LPARAM(0),
-            );
+        let list = logitech.poll(full);
+        let bt = bluetooth::read();
+        publish(list, &bt, notify);
+        // Between polls, battery events and receivers' connection notices
+        // update the list as they come in.
+        let until = Instant::now() + next;
+        next = INTERVAL;
+        loop {
+            match logitech.wait(until.saturating_duration_since(Instant::now()), wake) {
+                hidpp::Wake::Changed => publish(logitech.batteries(), &bt, notify),
+                hidpp::Wake::Poll => {
+                    // A device that just connected may take a moment to answer:
+                    // poll again soon.
+                    next = CONNECT_RETRY;
+                    break;
+                }
+                hidpp::Wake::Timeout => break,
+            }
         }
-        std::thread::park_timeout(INTERVAL);
     }
     unsafe {
         let _ = PostMessageW(
@@ -155,6 +165,39 @@ fn run(notify: HWND) {
     }
 }
 
+/// Merges the sources into LATEST and tells the UI.
+fn publish(mut list: Vec<Battery>, bt: &[Battery], notify: HWND) {
+    // A mouse moved from its receiver to Bluetooth (or a cable) answers on
+    // the new link; drop the old link's stale entry rather than list it twice.
+    let live: Vec<String> = list
+        .iter()
+        .filter(|b| !b.stale)
+        .map(|b| b.name.clone())
+        .collect();
+    list.retain(|b| !b.stale || !live.iter().any(|n| same_name(n, &b.name)));
+    let read = list.clone();
+    // A Logitech device on Bluetooth also has Windows' property: keep the
+    // HID++ entry, which knows about charging.
+    list.extend(
+        bt.iter()
+            .filter(|b| {
+                !read.iter().any(|l| {
+                    l.address.is_some() && l.address == b.address
+                        || l.link == Link::Bluetooth && same_name(&l.name, &b.name)
+                })
+            })
+            .cloned(),
+    );
+    *LATEST.lock().unwrap() = list;
+    unsafe {
+        let _ = PostMessageW(
+            Some(notify),
+            crate::sampler::WM_APP_SAMPLE,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
 fn same_name(a: &str, b: &str) -> bool {
     let norm = |s: &str| -> String {
         s.chars()

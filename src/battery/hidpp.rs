@@ -11,6 +11,7 @@
 
 use super::{Battery, ChargeState, Link};
 use crate::util::wide;
+use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
@@ -21,7 +22,9 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
     HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetHidGuid, HidD_GetPreparsedData,
     HidP_GetCaps, HIDD_ATTRIBUTES, HIDP_CAPS, PHIDP_PREPARSED_DATA,
 };
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_OVERLAPPED,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -35,6 +38,10 @@ const SHORT: u8 = 0x10;
 const LONG: u8 = 0x11;
 
 const ROOT: u8 = 0x00;
+/// HID++ 1.0 device connection notification, sent by receivers.
+const CONNECTION: u8 = 0x41;
+const SET_REGISTER: u8 = 0x80;
+const GET_REGISTER: u8 = 0x81;
 const DEVICE_NAME: u16 = 0x0005;
 const BATTERY_STATUS: u16 = 0x1000;
 const UNIFIED_BATTERY: u16 = 0x1004;
@@ -74,26 +81,51 @@ struct Known {
     recheck: bool,
 }
 
+/// What `Hidpp::wait` returns on.
+pub enum Wake {
+    /// The time is up, or `stop` was signalled.
+    Timeout,
+    /// A device sent new battery figures or lost its link: show `batteries()`.
+    Changed,
+    /// A device connected to a receiver: poll now.
+    Poll,
+}
+
 #[derive(Default)]
 pub struct Hidpp {
     ports: Vec<Port>,
     /// Port id → it's a receiver (else a device at 0xFF).
     receivers: Vec<(String, bool)>,
     known: Vec<Known>,
+    /// Open collections, kept between polls so the reads stay pending and
+    /// notifications come in as they're sent.
+    open: Vec<(String, Io)>,
 }
 
 impl Hidpp {
-    /// Reads every known device; with `full`, also looks for new receivers and
-    /// devices. Devices that don't answer keep their last reading, marked stale.
+    pub fn batteries(&self) -> Vec<Battery> {
+        self.known.iter().filter_map(|k| k.last.clone()).collect()
+    }
+
+    /// Reads every device; with `full`, first looks for receivers and devices
+    /// that came or went. Receiver devices that don't answer keep their last
+    /// reading, marked stale; a device whose own link (Bluetooth, cable) went
+    /// away is dropped.
     pub fn poll(&mut self, full: bool) -> Vec<Battery> {
         if full {
             self.ports = ports();
-            let ids: Vec<&String> = self.ports.iter().map(|p| &p.id).collect();
-            self.known.retain(|k| ids.contains(&&k.port));
+            let ids: Vec<String> = self.ports.iter().map(|p| p.id.clone()).collect();
+            self.known.retain(|k| ids.contains(&k.port));
+            self.open.retain(|(id, _)| ids.contains(id));
+            self.receivers.retain(|(id, _)| ids.contains(id));
         }
         for port in self.ports.clone() {
-            let Some(mut io) = Io::open(&port) else {
-                continue;
+            let mut io = match self.open.iter().position(|(id, _)| *id == port.id) {
+                Some(i) => self.open.swap_remove(i).1,
+                None => match Io::open(&port) {
+                    Some(io) => io,
+                    None => continue,
+                },
             };
             let receiver = match self.receivers.iter().find(|(id, _)| *id == port.id) {
                 Some(&(_, r)) => r,
@@ -101,28 +133,128 @@ impl Hidpp {
                     // A receiver answers a HID++ 2.0 ping at 0xFF with a HID++ 1.0
                     // error; a device on a cable or Bluetooth answers it.
                     let r = !port.bluetooth && io.request(0xFF, ROOT, 1, &[]).is_err();
+                    if r {
+                        io.wireless_notifications();
+                    }
                     self.receivers.push((port.id.clone(), r));
                     r
                 }
             };
-            let indexes: Vec<u8> = if !receiver {
-                vec![0xFF]
-            } else if full {
+            // Empty slots answer at once with an error, so every slot is asked:
+            // a device switched back to this receiver shows up at the next poll.
+            let indexes: Vec<u8> = if receiver {
                 (1..=6).collect()
             } else {
-                self.known
-                    .iter()
-                    .filter(|k| k.port == port.id)
-                    .map(|k| k.index)
-                    .collect()
+                vec![0xFF]
             };
             for index in indexes {
                 self.read(&mut io, &port, receiver, index);
             }
+            self.open.push((port.id.clone(), io));
         }
-        self.known.iter().filter_map(|k| k.last.clone()).collect()
+        self.batteries()
     }
 
+    /// Waits up to `timeout` for a notification from any open collection, or for
+    /// `stop`. Replies to G HUB's and Options+' requests come in too and are
+    /// skipped.
+    pub fn wait(&mut self, timeout: Duration, stop: HANDLE) -> Wake {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Notifications that came in while we were waiting for a reply.
+            for i in 0..self.open.len() {
+                for r in std::mem::take(&mut self.open[i].1.queued) {
+                    if let Some(w) = self.notice(i, &r) {
+                        return w;
+                    }
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Wake::Timeout;
+            }
+            let mut handles = vec![stop];
+            let mut from = Vec::new();
+            for (i, (_, io)) in self.open.iter().enumerate() {
+                for (short, r) in [(false, Some(&io.long)), (true, io.short.as_ref())] {
+                    if let Some(r) = r.filter(|r| r.pending) {
+                        if handles.len() < 64 {
+                            handles.push(r.ov.hEvent);
+                            from.push((i, short));
+                        }
+                    }
+                }
+            }
+            let ms = left.as_millis().clamp(1, u32::MAX as u128) as u32;
+            let w = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+            if w == WAIT_TIMEOUT {
+                return Wake::Timeout;
+            }
+            let n = w.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+            if n == 0 {
+                return Wake::Timeout;
+            }
+            let Some(&(i, short)) = from.get(n - 1) else {
+                // The wait itself failed; don't spin.
+                std::thread::sleep(left);
+                return Wake::Timeout;
+            };
+            let io = &mut self.open[i].1;
+            let report = if short {
+                io.short.as_mut().and_then(Reader::take)
+            } else {
+                io.long.take()
+            };
+            if let Some(w) = report.and_then(|r| self.notice(i, &r)) {
+                return w;
+            }
+        }
+    }
+
+    /// A report nobody asked for, from open collection `i`.
+    fn notice(&mut self, i: usize, r: &[u8]) -> Option<Wake> {
+        if r.len() < 7 {
+            return None;
+        }
+        let port = &self.open[i].0;
+        let index = r[1];
+        let known = self
+            .known
+            .iter_mut()
+            .find(|k| k.port == *port && k.index == index);
+        // HID++ 1.0 device connection, from a receiver; bit 6 of the flags set
+        // means the link was lost (asleep, switched off or to another host).
+        if r[2] == CONNECTION {
+            if r[4] & 0x40 != 0 {
+                let last = known?.last.as_mut()?;
+                return (!last.stale).then(|| {
+                    last.stale = true;
+                    Wake::Changed
+                });
+            }
+            // Maybe a different device in that slot: look it up again.
+            if let Some(k) = known {
+                k.recheck = true;
+            }
+            return Some(Wake::Poll);
+        }
+        // A battery event: the battery feature's event 0, software id 0. Both
+        // features' events carry the same bytes as their get_status reply.
+        let k = known?;
+        let (feature, fi) = k.battery?;
+        if r[0] != LONG || r[2] != fi || r[3] != 0 {
+            return None;
+        }
+        let (percent, charging, external) = if feature == UNIFIED_BATTERY {
+            unified(&r[4..])
+        } else {
+            status(&r[4..])
+        };
+        let last = k.last.as_mut()?;
+        (last.percent, last.charging, last.external, last.stale) =
+            (percent, Some(charging), external, false);
+        Some(Wake::Changed)
+    }
     fn read(&mut self, io: &mut Io, port: &Port, receiver: bool, index: u8) {
         let pos = self
             .known
@@ -467,6 +599,9 @@ impl Drop for Reader {
 struct Io {
     long: Reader,
     short: Option<Reader>,
+    /// Notifications (software id 0, or a receiver's 0x41) read while waiting
+    /// for a reply, for `Hidpp::wait`.
+    queued: Vec<Vec<u8>>,
 }
 
 impl Io {
@@ -477,7 +612,11 @@ impl Io {
         if let Some(s) = short.as_mut() {
             s.start();
         }
-        Some(Io { long, short })
+        Some(Io {
+            long,
+            short,
+            queued: Vec::new(),
+        })
     }
 
     /// Sends feature `feature`, function `function` to device `index` as a long
@@ -494,9 +633,9 @@ impl Io {
         out[..4].copy_from_slice(&[LONG, index, feature, fn_sw]);
         out[4..4 + params.len()].copy_from_slice(params);
         self.write(&out)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(TIMEOUT_MS);
+        let deadline = Instant::now() + Duration::from_millis(TIMEOUT_MS);
         loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(Fail::Timeout);
             }
@@ -511,9 +650,18 @@ impl Io {
                 1 => self.short.as_mut().and_then(Reader::take),
                 _ => return Err(Fail::Timeout),
             };
-            let Some(r) = report.filter(|r| r.len() >= 7 && r[1] == index) else {
+            let Some(r) = report.filter(|r| r.len() >= 7) else {
                 continue;
             };
+            if r[2] == CONNECTION || r[2] < 0x80 && r[3] & 0x0F == 0 {
+                if self.queued.len() < 32 {
+                    self.queued.push(r.clone());
+                }
+                continue;
+            }
+            if r[1] != index {
+                continue;
+            }
             // HID++ 2.0 error (0xFF) or HID++ 1.0 error from a receiver (0x8F).
             if (r[2] == 0xFF || r[2] == 0x8F) && r[3] == feature && r[4] == fn_sw {
                 return Err(Fail::Error(r[5]));
@@ -531,33 +679,91 @@ impl Io {
         }
     }
 
-    fn write(&mut self, report: &[u8; 20]) -> Result<(), Fail> {
-        unsafe {
-            let event = CreateEventW(None, true, false, PCWSTR::null()).map_err(|_| Fail::Io)?;
-            let mut ov = OVERLAPPED {
-                hEvent: event,
-                ..Default::default()
-            };
-            let started = match WriteFile(self.long.file, Some(report), None, Some(&mut ov)) {
-                Ok(()) => true,
-                Err(e) => e.code() == windows::Win32::Foundation::ERROR_IO_PENDING.to_hresult(),
-            };
-            let mut n = 0u32;
-            let ok = if started {
-                let done = windows::Win32::System::Threading::WaitForSingleObject(
-                    event,
-                    TIMEOUT_MS as u32,
-                ) == WAIT_OBJECT_0;
-                if !done {
-                    let _ = CancelIoEx(self.long.file, Some(&ov));
-                }
-                GetOverlappedResult(self.long.file, &ov, &mut n, true).is_ok() && done
-            } else {
-                false
-            };
-            let _ = CloseHandle(event);
-            ok.then_some(()).ok_or(Fail::Io)
+    /// HID++ 1.0 register 0x00 of a receiver holds its notification flags. Turns
+    /// on wireless notifications (device connected / link lost) if they're off,
+    /// keeping the other bits. G HUB and Options+ normally have them on already.
+    fn wireless_notifications(&mut self) {
+        let Some(short) = self.short.as_ref().map(|s| s.file) else {
+            return;
+        };
+        let get = [SHORT, 0xFF, GET_REGISTER, 0x00, 0, 0, 0];
+        if write(short, &get).is_err() {
+            return;
         }
+        let Some(flags) = self.register_reply(GET_REGISTER) else {
+            return;
+        };
+        if flags[1] & 0x01 == 0 {
+            let set = [
+                SHORT,
+                0xFF,
+                SET_REGISTER,
+                0x00,
+                flags[0],
+                flags[1] | 0x01,
+                flags[2],
+            ];
+            if write(short, &set).is_ok() {
+                let _ = self.register_reply(SET_REGISTER);
+            }
+        }
+    }
+
+    /// The receiver's answer to a register request on register 0x00.
+    fn register_reply(&mut self, sub: u8) -> Option<[u8; 3]> {
+        let deadline = Instant::now() + Duration::from_millis(TIMEOUT_MS);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let short = self.short.as_mut()?;
+            let w = unsafe {
+                WaitForMultipleObjects(&[short.ov.hEvent], false, left.as_millis() as u32)
+            };
+            if left.is_zero() || w != WAIT_OBJECT_0 {
+                return None;
+            }
+            let Some(r) = short.take().filter(|r| r.len() >= 7 && r[1] == 0xFF) else {
+                continue;
+            };
+            if r[2] == sub && r[3] == 0x00 {
+                return Some([r[4], r[5], r[6]]);
+            }
+            if r[2] == 0x8F && r[3] == sub {
+                return None;
+            }
+        }
+    }
+
+    fn write(&mut self, report: &[u8; 20]) -> Result<(), Fail> {
+        write(self.long.file, report)
+    }
+}
+
+/// An overlapped write to one collection, waited for.
+fn write(file: HANDLE, report: &[u8]) -> Result<(), Fail> {
+    unsafe {
+        let event = CreateEventW(None, true, false, PCWSTR::null()).map_err(|_| Fail::Io)?;
+        let mut ov = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
+        let started = match WriteFile(file, Some(report), None, Some(&mut ov)) {
+            Ok(()) => true,
+            Err(e) => e.code() == windows::Win32::Foundation::ERROR_IO_PENDING.to_hresult(),
+        };
+        let mut n = 0u32;
+        let ok = if started {
+            let done =
+                windows::Win32::System::Threading::WaitForSingleObject(event, TIMEOUT_MS as u32)
+                    == WAIT_OBJECT_0;
+            if !done {
+                let _ = CancelIoEx(file, Some(&ov));
+            }
+            GetOverlappedResult(file, &ov, &mut n, true).is_ok() && done
+        } else {
+            false
+        };
+        let _ = CloseHandle(event);
+        ok.then_some(()).ok_or(Fail::Io)
     }
 }
 
