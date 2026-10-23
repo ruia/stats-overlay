@@ -25,12 +25,12 @@ then start `target\release\statsoverlay.exe`.
 
 ## 3. Charging and sleep
 
-- Plug a Logitech mouse or keyboard into its cable: within a minute a slim green bolt
+- Plug a Logitech mouse or keyboard into its cable: within a few seconds a slim green bolt
   appears after the %, about as tall as the connection glyph. The panel adds
   "charged" when full and "plugged in" when on power but not charging; while
   charging the bolt alone says so.
 - Leave a keyboard alone until it sleeps: its % turns grey and the panel says
-  "asleep · last reading". Press a key: within a minute it's live again.
+  "asleep · last reading". Press a key: within a few seconds it's live again (the receiver announces it).
 - Below 20 % the number turns yellow, below 10 % red; at 15 % or less (not
   plugged in) Insights lists "<name> battery at N%".
 
@@ -82,3 +82,10 @@ kept recording its own battery readings.
 - Unticking a device hides it from the strip and the panel and is saved
   (`HiddenBatteries`); ticking it brings it back.
 - Strip, and all five panel styles, checked in the dark theme.
+- Updates come from the devices' own notifications: plugging and unplugging
+  either device's cable flips the bolt within a few seconds; switching the MX
+  from Bluetooth back to the Bolt dongle shows it there again right away.
+  Both receivers already had wireless notifications on (register 0x00:
+  `00 09 00` Bolt, `00 01 00` Lightspeed), so nothing was written.
+- Idle with the feature on and the collections held open: ~3.0 MB private
+  working set, ~0.05% CPU over a minute.
